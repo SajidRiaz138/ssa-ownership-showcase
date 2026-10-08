@@ -103,17 +103,60 @@ kubectl -n "$NS" patch cm demo-source --type merge -p '{"data":{"desired":"v2"}}
 sleep 2
 kubectl -n "$NS" get cm demo-config -o jsonpath='{.data.message}'; echo      # -> v2
 
-# tamper with the target directly; periodic resync (or a source event) repairs it:
+# tamper with the target directly:
 kubectl -n "$NS" patch cm demo-config --type merge -p '{"data":{"message":"tampered"}}'
+
+# The app watches the SOURCE, not the target, so target-only drift is repaired by the PERIODIC
+# RESYNC — whose production default is 5 minutes (ConfigReconcilerApp's default resyncInterval).
+# A SOURCE event triggers an immediate reconcile that also repairs the target:
+kubectl -n "$NS" patch cm demo-source --type merge -p '{"data":{"desired":"v2","nudge":"1"}}'
 sleep 2
 kubectl -n "$NS" get cm demo-config -o jsonpath='{.data.message}'; echo      # -> back to v2
 
+# (To see autonomous target-drift repair quickly without a source event, either wait out the
+#  5-minute resync, or run with a short resyncInterval — the IT
+#  periodic_resync_repairs_target_drift_autonomously uses 1s.)
+
 kubectl -n "$NS" logs deploy/demo-config-reconciler | tail -20               # reconcile outcomes
+
+# who owns the key? the app's fabric8 manager owns data.message; helm owns the object, not the key:
+kubectl -n "$NS" get cm demo-config --show-managed-fields -o json \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);[print(m.get("manager"),m.get("operation"),"owns-message=","f:message" in json.dumps(m.get("fieldsV1",{}))) for m in d["metadata"].get("managedFields",[])]'
 ```
 
 ### 4. Clean up
 ```
 helm uninstall demo -n "$NS"; kubectl delete ns "$NS"
+```
+
+### Captured run (minikube k8s 1.30, executed)
+
+```
+# image built into minikube's daemon:
+config-reconciler:local  343MB
+
+# helm install demo charts/config-reconciler-v2-app-owned -n ssa-app
+NAME: demo   STATUS: deployed   REVISION: 1
+deployment "demo-config-reconciler" successfully rolled out
+pod demo-config-reconciler-...  1/1 Running
+
+# enforcement:
+demo-config.data.message = 'v1'                       # initial (source desired=v1)
+# patch demo-source desired=v2:
+demo-config.data.message = 'v2'                       # propagated via the source watch
+# patch demo-config message=tampered, then a source event:
+demo-config.data.message = 'v2'                       # repaired
+
+# app logs:
+WatchLifecycle [source-watch] watch installed at gen 1
+ConfigReconcilerApp source event ADDED; triggering reconcile
+Reconciler [config-reconciler] enforced demo-config.message (upsert)
+ConfigReconcilerApp source event MODIFIED; triggering reconcile
+Reconciler [config-reconciler] enforced demo-config.message (upsert)
+
+# who owns data.message (managedFields):
+helm                       Update  owns-message=False     # chart owns the object, NOT the key
+fabric8-kubernetes-client  Update  owns-message=True      # the app is the runtime writer of the key
 ```
 
 > Note on "ownership": this path shows the application as the **runtime source of truth** for the
