@@ -56,7 +56,8 @@ public final class WatchLifecycle {
         DEGRADED
     }
 
-    /** An authorized unit of creation/installation work, identified by generation. */
+    /** An authorized unit of creation/installation work, identified by generation (monotonically
+     *  increasing within the process lifetime; long overflow is not a practical concern). */
     private static final class Attempt {
         final long generation;
         Attempt(long generation) { this.generation = generation; }
@@ -110,6 +111,7 @@ public final class WatchLifecycle {
                    Duration baseDelay, Duration maxDelay, Duration stableResetAfter,
                    LongSupplier nanoTime, Runnable afterRecoveryAuthorized) {
         this.name = Objects.requireNonNull(name, "name");
+        if (name.isBlank()) throw new IllegalArgumentException("name must not be blank");
         this.factory = Objects.requireNonNull(factory, "factory");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         Objects.requireNonNull(baseDelay, "baseDelay");

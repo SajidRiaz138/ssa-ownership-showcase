@@ -29,8 +29,8 @@ public final class BrokenSchemaSyncReconciler {
     private final String namespace;
 
     public BrokenSchemaSyncReconciler(KubernetesClient client, String namespace) {
-        this.client = client;
-        this.namespace = namespace;
+        this.client = java.util.Objects.requireNonNull(client, "client");
+        this.namespace = java.util.Objects.requireNonNull(namespace, "namespace");
     }
 
     /** Reconcile: (wrongly) server-side-apply the spec, co-owning spec.schemaVersion. */

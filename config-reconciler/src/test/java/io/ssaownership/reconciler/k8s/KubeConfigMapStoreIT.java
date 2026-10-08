@@ -113,23 +113,19 @@ class KubeConfigMapStoreIT {
     void conflict_retry_exhaustion_throws_immediately_with_zero_retries() {
         createCm(Map.of());
         // retries=0: the FIRST conflict exhausts immediately. The pre-write seam fires only on
-        // attempt 0 (by design), so a single injected concurrent insert is enough to force the
-        // one-and-only write to conflict. This validates immediate exhaustion, not multi-retry
-        // exhaustion (which would require per-attempt injection the single seam does not provide).
+        // attempt 0 (by design), so a single injected concurrent insert forces the one-and-only
+        // write to conflict. The contract says retry exhaustion MUST throw StoreException, so the
+        // test requires the throw (it must NOT be satisfied by a false return).
         Runnable concurrentInsert = () -> client.configMaps().inNamespace(ns).withName(cm)
                 .edit(c -> new ConfigMapBuilder(c).addToData(key, "other-writer").build());
         KubeConfigMapStore store = new KubeConfigMapStore(client, ns, 0, concurrentInsert);
-        // The concurrent insert makes the key present, so after the 409 re-read the adapter would
-        // normally return false; with retries=0 the conflict path exhausts first. Either way it
-        // must not silently succeed with OUR value:
-        boolean wrote;
-        try {
-            wrote = store.putIfAbsent(cm, key, "app-default");
-        } catch (ConfigMapStore.StoreException expected) {
-            wrote = false;   // exhaustion path
-        }
-        assertFalse(wrote, "must not report having written our value");
-        assertEquals("other-writer", store.get(cm, key).orElseThrow(), "the other writer's value stands");
+
+        assertThrows(ConfigMapStore.StoreException.class,
+                () -> store.putIfAbsent(cm, key, "app-default"),
+                "retry exhaustion must throw StoreException (contract), not return false");
+        // and the concurrent writer's value must be intact:
+        assertEquals("other-writer", store.get(cm, key).orElseThrow(),
+                "the concurrent writer's value stands after exhaustion");
     }
 
     @Test @Timeout(60)

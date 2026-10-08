@@ -21,24 +21,27 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Deterministic unit tests for {@link ReconcileCoordinator}. A real {@link Reconciler} is driven
  * over a controllable in-test {@link ConfigMapStore}; a real single-thread scheduled executor
- * serialises drains. Latches make interleavings explicit — no sleeps as correctness evidence.
+ * serialises drains. Latches signal pass ENTRY and SETTLEMENT — no spin loops, no sleeps as
+ * correctness evidence.
  */
 class ReconcileCoordinatorTest {
 
-    /** Controllable store: counts passes, can block one pass, can force FAILED via a throwing get. */
+    /** Controllable store: signals each pass entry, can block a pass, can force FAILED. */
     static final class ControllableStore implements ConfigMapStore {
         final AtomicInteger passes = new AtomicInteger();
+        volatile CountDownLatch entered;          // counted down at each get() entry (if set)
         volatile CountDownLatch blockOnPass;      // if set, the next get() blocks on it
         volatile boolean failNext = false;
         final AtomicReference<String> value = new AtomicReference<>(null);
 
         @Override public Optional<String> get(String cm, String key) {
             passes.incrementAndGet();
+            CountDownLatch e = entered; if (e != null) e.countDown();
             CountDownLatch gate = blockOnPass;
             if (gate != null) {
                 blockOnPass = null;
                 try { if (!gate.await(5, TimeUnit.SECONDS)) throw new AssertionError("gate"); }
-                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw new AssertionError(ie); }
             }
             if (failNext) { failNext = false; throw new StoreException("injected"); }
             return Optional.ofNullable(value.get());
@@ -57,67 +60,130 @@ class ReconcileCoordinatorTest {
         exec = Executors.newSingleThreadScheduledExecutor();
         store = new ControllableStore();
         Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "desired");
-        return new ReconcileCoordinator(r, exec, retry, resync);
+        coord = new ReconcileCoordinator(r, exec, retry, resync);
+        return coord;
     }
 
     @AfterEach
-    void tearDown() {
+    void tearDown() throws Exception {
         if (coord != null) coord.close();
-        if (exec != null) { exec.shutdownNow(); }
+        if (exec != null) {
+            exec.shutdownNow();
+            assertTrue(exec.awaitTermination(5, TimeUnit.SECONDS), "executor must terminate");
+        }
     }
 
     @Test @Timeout(10)
     void triggers_during_a_pass_coalesce_into_exactly_one_follow_up() throws Exception {
-        coord = build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+        build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+        CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
-        store.blockOnPass = release;                       // the first pass blocks inside get()
+        store.entered = entered;
+        store.blockOnPass = release;                       // pass 1 blocks inside get()
 
-        coord.trigger();                                   // starts drain; pass 1 blocks on release
-        // wait until pass 1 is actually running (passes incremented to 1)
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (store.passes.get() < 1 && System.nanoTime() < deadline) Thread.onSpinWait();
-        assertEquals(1, store.passes.get(), "pass 1 running");
+        coord.trigger();                                   // starts drain; pass 1 blocks
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "pass 1 must enter");
         assertTrue(coord.debugRunning());
 
-        // fire MANY triggers while pass 1 is blocked -> they must collapse into ONE follow-up
-        for (int i = 0; i < 50; i++) coord.trigger();
+        for (int i = 0; i < 50; i++) coord.trigger();      // many triggers while blocked
         assertTrue(coord.debugDirty(), "triggers during a pass set the dirty flag");
 
         release.countDown();                               // let pass 1 finish; one follow-up runs
-        // after the dust settles there must be exactly 2 passes total (1 + a single coalesced one)
-        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (coord.debugRunning() && System.nanoTime() < deadline) Thread.onSpinWait();
+        awaitSettled();
         assertEquals(2, store.passes.get(), "50 triggers during a pass collapse into exactly one follow-up");
         assertFalse(coord.debugDirty());
     }
 
     @Test @Timeout(10)
     void failed_outcome_schedules_a_retry_without_a_new_trigger() throws Exception {
-        coord = build(Duration.ofMillis(200), Duration.ofMinutes(10));
-        store.value.set("desired");       // in sync, so a pass would normally SKIP...
-        store.failNext = true;            // ...but the first get() throws -> FAILED
+        build(Duration.ofMillis(150), Duration.ofMinutes(10));
+        store.value.set("desired");
+        store.failNext = true;                             // first pass FAILED
         coord.trigger();
-        // the retry (no new trigger) must produce a second pass:
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (store.passes.get() < 2 && System.nanoTime() < deadline) Thread.onSpinWait();
+        awaitPasses(2);                                    // the retry (no new trigger) runs
         assertTrue(store.passes.get() >= 2, "FAILED must schedule a retry pass without a new trigger");
     }
 
     @Test @Timeout(10)
-    void closed_coordinator_declines_new_work() {
-        coord = build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+    void close_cancels_a_pending_retry_and_prevents_post_close_reconcile() throws Exception {
+        // The BLOCKING correctness test: fail -> retry reserved -> close -> run the (canceled)
+        // retry body DELIBERATELY -> assert NO additional reconcile pass. Correctness must come
+        // from the token/closed check, not from cancellation.
+        build(Duration.ofHours(1), Duration.ofMinutes(10));   // long retry so it never fires on its own
+        store.failNext = true;
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        store.entered = firstEntered;
+        coord.trigger();
+        assertTrue(firstEntered.await(5, TimeUnit.SECONDS), "first pass ran");
+        // wait until RETRY_PENDING is established
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!coord.debugRetryPending() && System.nanoTime() < deadline) { /* short */ Thread.yield(); }
+        assertTrue(coord.debugRetryPending(), "a retry must be pending after FAILED");
+        long tokenBefore = coord.debugRetryToken();
+        int passesBefore = store.passes.get();
+
         coord.close();
         assertTrue(coord.debugClosed());
-        coord.trigger();                                   // must be a no-op
+        assertNotEquals(tokenBefore, coord.debugRetryToken(), "close must invalidate the retry token");
+
+        // Deterministically run the retry body with its ORIGINAL (now stale) token, exactly as a
+        // dequeued timer would. The token/closed check must make it a no-op — NOT reconcile.
+        coord.debugRunRetry(tokenBefore);
+        // And a direct trigger after close must also be a no-op:
+        coord.trigger();
+        assertEquals(passesBefore, store.passes.get(),
+                "no reconcile pass may run after close (stale retry and trigger both declined)");
+    }
+
+    @Test @Timeout(10)
+    void a_trigger_expedites_a_pending_retry() throws Exception {
+        // After FAILED, a real trigger must EXPEDITE: cancel the long delayed retry and run an
+        // immediate pass, not wait out the retry delay.
+        build(Duration.ofHours(1), Duration.ofMinutes(10));   // retry delay effectively "never"
+        store.failNext = true;
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        store.entered = firstEntered;
+        coord.trigger();
+        assertTrue(firstEntered.await(5, TimeUnit.SECONDS), "first (failing) pass ran");
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!coord.debugRetryPending() && System.nanoTime() < deadline) Thread.yield();
+        assertTrue(coord.debugRetryPending(), "retry pending after FAILED");
+
+        CountDownLatch secondEntered = new CountDownLatch(1);
+        store.entered = secondEntered;
+        coord.trigger();                                   // must expedite, not wait the 1h delay
+        assertTrue(secondEntered.await(5, TimeUnit.SECONDS),
+                "a trigger must expedite the pending retry into an immediate pass");
+        awaitSettled();
+        assertEquals(2, store.passes.get(), "exactly the failing pass + the expedited pass (no extra)");
+    }
+
+    @Test @Timeout(10)
+    void closed_coordinator_declines_new_work() {
+        build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+        coord.close();
+        assertTrue(coord.debugClosed());
+        coord.trigger();
         assertFalse(coord.debugRunning(), "closed coordinator starts no drain");
         assertEquals(0, store.passes.get(), "no pass after close");
     }
 
     @Test @Timeout(10)
     void trigger_after_executor_shutdown_does_not_throw() {
-        coord = build(Duration.ofSeconds(1), Duration.ofMinutes(10));
-        exec.shutdownNow();                                // executor gone, coordinator not closed
+        build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+        exec.shutdownNow();
         assertDoesNotThrow(coord::trigger,
                 "a trigger must swallow executor rejection (never throw back into a watch callback)");
+    }
+
+    // ---- helpers ----
+    private void awaitSettled() throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (coord.debugRunning() && System.nanoTime() < deadline) Thread.sleep(5);
+        assertFalse(coord.debugRunning(), "coordinator must settle");
+    }
+    private void awaitPasses(int n) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (store.passes.get() < n && System.nanoTime() < deadline) Thread.sleep(5);
     }
 }

@@ -18,6 +18,7 @@ import org.junit.jupiter.api.condition.EnabledIf;
 
 import java.io.InputStream;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -37,7 +38,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @EnabledIf("clusterAvailable")
 class SchemaSyncOwnershipIT {
 
-    static final String CHART_MANAGER = "helm";
+    static final String CHART_MANAGER = "chart-ssa-manager";   // models a chart/deployment SSA writer
     static boolean clusterAvailable() {
         if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster"))) {
             return true;   // profile active: do NOT skip — let a real failure surface
@@ -57,8 +58,13 @@ class SchemaSyncOwnershipIT {
         client.namespaces().resource(new NamespaceBuilder()
                 .withNewMetadata().withName(ns).endMetadata().build()).create();
         try (InputStream crd = getClass().getResourceAsStream("/crd/schemabinding-crd.yaml")) {
+            Objects.requireNonNull(crd, "missing /crd/schemabinding-crd.yaml on the test classpath");
             CustomResourceDefinition def = client.apiextensions().v1()
                     .customResourceDefinitions().load(crd).item();
+            // The /status subresource MUST be configured for updateStatus() to target it.
+            boolean statusEnabled = def.getSpec().getVersions().stream()
+                    .anyMatch(v -> v.getSubresources() != null && v.getSubresources().getStatus() != null);
+            assertTrue(statusEnabled, "CRD must enable the status subresource");
             client.apiextensions().v1().customResourceDefinitions().resource(def).serverSideApply();
         }
         awaitCrdEstablished("schemabindings.ssaownership.io", Duration_SECONDS(30));
@@ -111,26 +117,48 @@ class SchemaSyncOwnershipIT {
         return sb != null && sb.getStatus() != null ? sb.getStatus().getObservedSchemaVersion() : null;
     }
 
-    /** True iff the given field manager owns spec.schemaVersion per managedFields. */
+    /**
+     * True iff {@code manager} owns {@code spec.schemaVersion} via an Apply operation, determined
+     * by STRUCTURED traversal of the managedFields fieldsV1 tree (serialized to JSON), not by a
+     * fragile toString() substring. The SSA fieldset encodes paths as nested keys {@code f:spec}
+     * then {@code f:schemaVersion}.
+     */
     private boolean ownsSpecSchemaVersion(String manager) {
-        SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
-        List<ManagedFieldsEntry> mf = sb.getMetadata().getManagedFields();
-        if (mf == null) return false;
-        for (ManagedFieldsEntry e : mf) {
-            if (!manager.equals(e.getManager())) continue;
-            Object fields = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
-            if (fields != null && fields.toString().contains("schemaVersion")) return true;
+        for (ManagedFieldsEntry e : managedFieldsFor(manager, "Apply")) {
+            com.fasterxml.jackson.databind.JsonNode spec = fieldsTree(e).get("f:spec");
+            if (spec != null && spec.has("f:schemaVersion")) return true;
         }
         return false;
     }
-    private boolean anyManagerOwnsSpec() {
+
+    /** True iff {@code manager} owns ANY path beneath {@code f:spec} (Apply operation). */
+    private boolean ownsAnySpecPath(String manager) {
+        for (ManagedFieldsEntry e : managedFieldsFor(manager, "Apply")) {
+            com.fasterxml.jackson.databind.JsonNode spec = fieldsTree(e).get("f:spec");
+            if (spec != null && spec.size() > 0) return true;
+        }
+        return false;
+    }
+
+    private List<ManagedFieldsEntry> managedFieldsFor(String manager, String operation) {
         SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
         List<ManagedFieldsEntry> mf = sb.getMetadata().getManagedFields();
-        if (mf == null) return false;
-        return mf.stream().anyMatch(e -> {
-            Object f = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
-            return f != null && f.toString().contains("f:spec");
-        });
+        if (mf == null) return List.of();
+        return mf.stream()
+                .filter(e -> manager.equals(e.getManager()))
+                .filter(e -> operation == null || operation.equals(e.getOperation()))
+                .toList();
+    }
+
+    /** Serialize an entry's fieldsV1 to a JSON tree for structured path inspection. */
+    private com.fasterxml.jackson.databind.JsonNode fieldsTree(ManagedFieldsEntry e) {
+        try {
+            Object props = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
+            String json = io.fabric8.kubernetes.client.utils.Serialization.asJson(props == null ? java.util.Map.of() : props);
+            return new com.fasterxml.jackson.databind.ObjectMapper().readTree(json);
+        } catch (Exception ex) {
+            throw new AssertionError("failed to parse managedFields fieldsV1", ex);
+        }
     }
 
     @Test @Timeout(120)
@@ -155,9 +183,9 @@ class SchemaSyncOwnershipIT {
 
         assertEquals("1.0", statusObserved(), "fixed operator records observed state in status");
         assertEquals("1.0", specVersion(), "spec untouched by the operator");
-        // the operator must NOT appear as an owner of any spec field:
-        assertFalse(ownsSpecSchemaVersion(FixedSchemaSyncReconciler.FIELD_MANAGER),
-                "status-only operator must not own spec.schemaVersion");
+        // the operator must NOT own ANY path under spec (not merely spec.schemaVersion):
+        assertFalse(ownsAnySpecPath(FixedSchemaSyncReconciler.FIELD_MANAGER),
+                "status-only operator must not own any spec field");
 
         assertDoesNotThrow(() -> chartApply("2.0", false),
                 "chart apply must NOT conflict when the operator owns no spec field");
@@ -191,7 +219,7 @@ class SchemaSyncOwnershipIT {
 
         fixed.reconcile(name);
         assertEquals("2.0", statusObserved());
-        assertFalse(ownsSpecSchemaVersion(FixedSchemaSyncReconciler.FIELD_MANAGER),
+        assertFalse(ownsAnySpecPath(FixedSchemaSyncReconciler.FIELD_MANAGER),
                 "the fixed operator still introduces no spec claim");
     }
 }

@@ -22,8 +22,16 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The runnable application: it OWNS the field {@code <configMap>.data.<key>} at runtime,
- * demonstrating the "application owns it, not the chart" resolution to the SSA two-writer problem.
+ * The runnable application: it is the RUNTIME SOURCE OF TRUTH for the field
+ * {@code <configMap>.data.<key>} and enforces it through reconciliation — the "application owns it
+ * at runtime, not the chart" resolution to the SSA two-writer problem.
+ *
+ * <p><b>Note on "ownership".</b> This is operational enforcement, not named server-side-apply
+ * field ownership: {@link KubeConfigMapStore} uses ordinary resourceVersion-guarded updates, so
+ * the application does not register an SSA field manager in {@code managedFields} for this key.
+ * The fix here is organisational (the chart stops writing the key; the app enforces it). Named SSA
+ * field-manager behaviour — co-ownership conflicts and an ownership handoff — is demonstrated
+ * separately by the SchemaBinding operator scenario, not by this ConfigMap path.
  *
  * <h2>Composition</h2>
  * <ul>
@@ -52,12 +60,12 @@ public final class ConfigReconcilerApp implements AutoCloseable {
     private final String key;
     private final ReconcileCoordinator coordinator;
     private final WatchLifecycle lifecycle;
-    private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "config-reconciler-worker"); t.setDaemon(true); return t;
-    });
-    private final ScheduledExecutorService recoveryExec = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "config-reconciler-recovery"); t.setDaemon(true); return t;
-    });
+    private final ScheduledExecutorService worker;
+    private final ScheduledExecutorService recoveryExec;
+
+    private enum LifeState { NEW, STARTED, CLOSED }
+    private final java.util.concurrent.atomic.AtomicReference<LifeState> lifeState =
+            new java.util.concurrent.atomic.AtomicReference<>(LifeState.NEW);
 
     public ConfigReconcilerApp(KubernetesClient client, String namespace,
                                String sourceConfigMap, String targetConfigMap, String key) {
@@ -68,20 +76,35 @@ public final class ConfigReconcilerApp implements AutoCloseable {
     public ConfigReconcilerApp(KubernetesClient client, String namespace,
                                String sourceConfigMap, String targetConfigMap, String key,
                                Duration retryDelay, Duration resyncInterval) {
-        this.client = Objects.requireNonNull(client);
-        this.namespace = Objects.requireNonNull(namespace);
-        this.sourceConfigMap = Objects.requireNonNull(sourceConfigMap);
-        this.targetConfigMap = Objects.requireNonNull(targetConfigMap);
-        this.key = Objects.requireNonNull(key);
+        this.client = Objects.requireNonNull(client, "client");
+        this.namespace = Objects.requireNonNull(namespace, "namespace");
+        this.sourceConfigMap = Objects.requireNonNull(sourceConfigMap, "sourceConfigMap");
+        this.targetConfigMap = Objects.requireNonNull(targetConfigMap, "targetConfigMap");
+        this.key = Objects.requireNonNull(key, "key");
 
-        ConfigMapStore store = new KubeConfigMapStore(client, namespace);
-        Reconciler reconciler = new Reconciler("config-reconciler", targetConfigMap, key,
-                WriteStrategy.UPSERT, store, this::deriveFromSource);
-        this.coordinator = new ReconcileCoordinator(reconciler, worker, retryDelay, resyncInterval);
+        // Create executors as LOCALS and only publish them (and the composed dependencies) after
+        // all construction succeeds, shutting them down if any later step throws — so a failed
+        // construction leaks no daemon executors.
+        ScheduledExecutorService w = Executors.newSingleThreadScheduledExecutor(daemon("config-reconciler-worker"));
+        ScheduledExecutorService rec = Executors.newSingleThreadScheduledExecutor(daemon("config-reconciler-recovery"));
+        try {
+            ConfigMapStore store = new KubeConfigMapStore(client, namespace);
+            Reconciler reconciler = new Reconciler("config-reconciler", targetConfigMap, key,
+                    WriteStrategy.UPSERT, store, this::deriveFromSource);
+            this.coordinator = new ReconcileCoordinator(reconciler, w, retryDelay, resyncInterval);
+            this.lifecycle = new WatchLifecycle("source-watch", this::watchSource,
+                    new ExecutorRecoveryScheduler(rec));
+        } catch (RuntimeException | Error constructionFailure) {
+            w.shutdownNow();
+            rec.shutdownNow();
+            throw constructionFailure;
+        }
+        this.worker = w;
+        this.recoveryExec = rec;
+    }
 
-        WatchFactory factory = this::watchSource;
-        this.lifecycle = new WatchLifecycle("source-watch", factory,
-                new ExecutorRecoveryScheduler(recoveryExec));
+    private static java.util.concurrent.ThreadFactory daemon(String name) {
+        return r -> { Thread t = new Thread(r, name); t.setDaemon(true); return t; };
     }
 
     private String deriveFromSource() {
@@ -135,21 +158,29 @@ public final class ConfigReconcilerApp implements AutoCloseable {
         }
     }
 
-    /** Start: begin periodic resync and install the watch (which triggers the initial reconcile). */
+    /** Start: begin periodic resync and install the watch (which triggers the initial reconcile).
+     *  One-time: a second {@code start()} (or {@code start()} after {@code close()}) is rejected. */
     public void start() {
+        if (!lifeState.compareAndSet(LifeState.NEW, LifeState.STARTED)) {
+            throw new IllegalStateException("start() is one-time; current state=" + lifeState.get());
+        }
         LOG.info("starting; source={} target={}.{}", sourceConfigMap, targetConfigMap, key);
         coordinator.startPeriodicResync();
         lifecycle.registerWatch();
     }
 
     /**
-     * Bounded, coordinated shutdown. Deactivate the lifecycle (no further installs), close the
-     * coordinator (terminal; no new drains), then shut the executors down and AWAIT their
-     * termination within a budget. {@code shutdownNow()} only requests interruption; termination
-     * is what we actually wait for. The caller keeps the Kubernetes client open until this returns.
+     * Bounded, coordinated, IDEMPOTENT shutdown. Deactivate the lifecycle (no further installs),
+     * close the coordinator (terminal; cancels retry/resync), then shut the executors down and
+     * AWAIT their termination within a budget. {@code shutdownNow()} only requests interruption;
+     * termination is what we actually wait for. The caller keeps the Kubernetes client open until
+     * this returns. A second call is a no-op.
      */
     @Override
     public void close() {
+        if (lifeState.getAndSet(LifeState.CLOSED) == LifeState.CLOSED) {
+            return;     // idempotent
+        }
         lifecycle.deactivate();
         coordinator.close();
         worker.shutdownNow();

@@ -17,6 +17,18 @@ import java.util.Optional;
  * in particular the concurrency-safe {@link #putIfAbsent}: it reads, checks the key, and writes
  * at the OBSERVED resourceVersion; on a 409 conflict it re-reads and re-evaluates (the key may
  * now be present, in which case it preserves it). A naive read-then-write is deliberately avoided.
+ *
+ * <p><b>UPSERT does not retry conflicts internally.</b> {@link #upsert} performs a single
+ * optimistic update at the observed resourceVersion and propagates a 409 conflict as a
+ * {@link StoreException}. Retrying a conflicted enforcement is the application's job: the
+ * reconcile coordinator retries the pass, which RE-OBSERVES current state before deciding to
+ * write again. Keeping the retry at the reconcile level (not inside the adapter) ensures the
+ * desired-vs-observed comparison is re-evaluated against fresh state on every attempt.
+ *
+ * <p><b>Whole-resource update, not key-level SSA.</b> Writes update a copied ConfigMap resource
+ * with resourceVersion protection against lost updates; they do NOT establish an independent
+ * server-side-apply field manager for the key. Named SSA field ownership is demonstrated by the
+ * SchemaBinding operator scenario, not by this adapter.
  */
 public final class KubeConfigMapStore implements ConfigMapStore {
 

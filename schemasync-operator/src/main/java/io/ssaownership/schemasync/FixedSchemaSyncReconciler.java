@@ -42,8 +42,8 @@ public final class FixedSchemaSyncReconciler {
     private final String namespace;
 
     public FixedSchemaSyncReconciler(KubernetesClient client, String namespace) {
-        this.client = client;
-        this.namespace = namespace;
+        this.client = java.util.Objects.requireNonNull(client, "client");
+        this.namespace = java.util.Objects.requireNonNull(namespace, "namespace");
     }
 
     /** Reconcile: write ONLY status.observedSchemaVersion (never spec). */
