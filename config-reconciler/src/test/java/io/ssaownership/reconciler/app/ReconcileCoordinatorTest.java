@@ -21,8 +21,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Deterministic unit tests for {@link ReconcileCoordinator}. A real {@link Reconciler} is driven
  * over a controllable in-test {@link ConfigMapStore}; a real single-thread scheduled executor
- * serialises drains. Latches signal pass ENTRY and SETTLEMENT — no spin loops, no sleeps as
- * correctness evidence.
+ * serialises drains. Latches signal pass ENTRY and the key interleavings; a couple of helpers
+ * bounded-poll a state flag with a short sleep purely to await settlement/termination — never as
+ * the correctness assertion itself, which is always a latch, a count, or a state check.
  */
 class ReconcileCoordinatorTest {
 
@@ -174,6 +175,125 @@ class ReconcileCoordinatorTest {
         exec.shutdownNow();
         assertDoesNotThrow(coord::trigger,
                 "a trigger must swallow executor rejection (never throw back into a watch callback)");
+    }
+
+    // ---- duration validation / normalization -------------------------------------------------
+
+    @Test @Timeout(10)
+    void durations_are_validated_and_normalized() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, new ControllableStore(), () -> "d");
+        assertThrows(IllegalArgumentException.class,
+                () -> new ReconcileCoordinator(r, exec, Duration.ZERO, Duration.ofSeconds(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMillis(-1)));
+        IllegalArgumentException ov = assertThrows(IllegalArgumentException.class,
+                () -> new ReconcileCoordinator(r, exec, Duration.ofSeconds(Long.MAX_VALUE), Duration.ofSeconds(1)));
+        assertTrue(ov.getMessage().contains("retryDelay"), "overflow names retryDelay: " + ov.getMessage());
+        assertDoesNotThrow(() -> new ReconcileCoordinator(r, exec, Duration.ofNanos(1), Duration.ofNanos(1)));
+    }
+
+    @Test @Timeout(10)
+    void sub_millisecond_resync_is_normalized_and_actually_schedules() throws Exception {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(10), Duration.ofNanos(1));
+        CountDownLatch entered = new CountDownLatch(1);
+        store.entered = entered;
+        coord.startPeriodicResync();                       // 0ms would be rejected; 1ms must run
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "normalized sub-ms resync must actually run a pass");
+    }
+
+    // ---- unexpected-rejection observer -------------------------------------------------------
+
+    @Test @Timeout(10)
+    void unexpected_rejection_while_open_invokes_observer_exactly_once() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        AtomicInteger observed = new AtomicInteger();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMinutes(10),
+                rej -> observed.incrementAndGet());
+        exec.shutdownNow();                                // executor dies unexpectedly, coordinator OPEN
+        coord.trigger();
+        assertEquals(1, observed.get(), "unexpected rejection while open invokes the observer exactly once");
+    }
+
+    @Test @Timeout(10)
+    void rejection_after_close_does_not_invoke_the_observer() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        AtomicInteger observed = new AtomicInteger();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMinutes(10),
+                rej -> observed.incrementAndGet());
+        coord.close();
+        exec.shutdownNow();
+        coord.trigger();
+        assertEquals(0, observed.get(), "a rejection after close must not invoke the observer");
+    }
+
+    @Test @Timeout(10)
+    void a_throwing_observer_does_not_escape_through_trigger() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMinutes(10),
+                rej -> { throw new RuntimeException("observer blew up"); });
+        exec.shutdownNow();
+        assertDoesNotThrow(coord::trigger, "a throwing observer must not escape through trigger()");
+        assertDoesNotThrow(coord::trigger, "state remains consistent after an observer failure");
+    }
+
+    // ---- pending-retry handle cancellation (recording scheduled executor) --------------------
+
+    @Test @Timeout(10)
+    void close_cancels_the_actual_retry_future_and_a_stale_run_does_nothing() throws Exception {
+        RecordingScheduledExecutor rec = new RecordingScheduledExecutor();
+        exec = rec;
+        store = new ControllableStore();
+        store.failNext = true;
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, rec, Duration.ofSeconds(5), Duration.ofMinutes(10));
+
+        coord.trigger();                                   // execute() runs inline -> first pass FAILED
+        assertTrue(coord.debugRetryPending(), "retry pending after FAILED");
+        RecordingScheduledExecutor.RecordedFuture retry = rec.lastScheduled();
+        assertNotNull(retry, "a retry future was scheduled");
+        long token = coord.debugRetryToken();
+
+        coord.close();
+        assertTrue(retry.cancelled.get(), "close must cancel the ACTUAL retry future");
+        int before = store.passes.get();
+        coord.debugRunRetry(token);                        // run the stale retry body deliberately
+        assertEquals(before, store.passes.get(), "a stale/canceled retry performs no reconcile");
+    }
+
+    /** Scheduled executor that runs execute() inline and records schedule() calls with cancelable,
+     *  non-auto-running futures — so a test can assert cancellation and run stale bodies by hand. */
+    static final class RecordingScheduledExecutor extends java.util.concurrent.ScheduledThreadPoolExecutor {
+        RecordingScheduledExecutor() { super(1); }
+        private volatile RecordedFuture last;
+        RecordedFuture lastScheduled() { return last; }
+
+        @Override public void execute(Runnable command) { command.run(); }   // inline, deterministic
+        @Override public java.util.concurrent.ScheduledFuture<?> schedule(
+                Runnable command, long delay, TimeUnit unit) {
+            RecordedFuture f = new RecordedFuture();
+            last = f;
+            return f;                                      // do NOT run; the test drives it
+        }
+        static final class RecordedFuture implements java.util.concurrent.ScheduledFuture<Object> {
+            final java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+            @Override public long getDelay(TimeUnit u) { return 0; }
+            @Override public int compareTo(java.util.concurrent.Delayed o) { return 0; }
+            @Override public boolean cancel(boolean i) { cancelled.set(true); return true; }
+            @Override public boolean isCancelled() { return cancelled.get(); }
+            @Override public boolean isDone() { return cancelled.get(); }
+            @Override public Object get() { return null; }
+            @Override public Object get(long t, TimeUnit u) { return null; }
+        }
     }
 
     // ---- helpers ----

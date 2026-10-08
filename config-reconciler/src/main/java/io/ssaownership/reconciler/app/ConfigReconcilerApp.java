@@ -77,10 +77,10 @@ public final class ConfigReconcilerApp implements AutoCloseable {
                                String sourceConfigMap, String targetConfigMap, String key,
                                Duration retryDelay, Duration resyncInterval) {
         this.client = Objects.requireNonNull(client, "client");
-        this.namespace = Objects.requireNonNull(namespace, "namespace");
-        this.sourceConfigMap = Objects.requireNonNull(sourceConfigMap, "sourceConfigMap");
-        this.targetConfigMap = Objects.requireNonNull(targetConfigMap, "targetConfigMap");
-        this.key = Objects.requireNonNull(key, "key");
+        this.namespace = requireNonBlank(namespace, "namespace");
+        this.sourceConfigMap = requireNonBlank(sourceConfigMap, "sourceConfigMap");
+        this.targetConfigMap = requireNonBlank(targetConfigMap, "targetConfigMap");
+        this.key = requireNonBlank(key, "key");
 
         // Create executors as LOCALS and only publish them (and the composed dependencies) after
         // all construction succeeds, shutting them down if any later step throws — so a failed
@@ -107,10 +107,30 @@ public final class ConfigReconcilerApp implements AutoCloseable {
         return r -> { Thread t = new Thread(r, name); t.setDaemon(true); return t; };
     }
 
+    private static String requireNonBlank(String v, String what) {
+        Objects.requireNonNull(v, what);
+        if (v.isBlank()) throw new IllegalArgumentException(what + " must not be blank");
+        return v;
+    }
+
+    /**
+     * Derive the value to enforce from the SOURCE ConfigMap's {@code desired} key.
+     *
+     * <p><b>Missing-source policy (deliberate).</b> If the source ConfigMap is absent, has no data,
+     * or lacks the {@code desired} key, this throws — the reconcile pass becomes
+     * {@link Reconciler.Outcome#FAILED}, which performs NO write and therefore PRESERVES the
+     * current target value. This is intentional: an accidental source deletion must NOT cause the
+     * target to be overwritten with a fabricated default. (If a default were desired for a truly
+     * absent source, that would be a different, explicit policy.)
+     */
     private String deriveFromSource() {
         ConfigMap src = client.configMaps().inNamespace(namespace).withName(sourceConfigMap).get();
         String desired = (src != null && src.getData() != null) ? src.getData().get("desired") : null;
-        return desired != null ? desired : "derived-default";
+        if (desired == null) {
+            throw new IllegalStateException("source " + sourceConfigMap
+                    + " missing or has no 'desired' key; preserving target (reconcile FAILED)");
+        }
+        return desired;
     }
 
     /**
@@ -165,8 +185,13 @@ public final class ConfigReconcilerApp implements AutoCloseable {
             throw new IllegalStateException("start() is one-time; current state=" + lifeState.get());
         }
         LOG.info("starting; source={} target={}.{}", sourceConfigMap, targetConfigMap, key);
-        coordinator.startPeriodicResync();
-        lifecycle.registerWatch();
+        try {
+            coordinator.startPeriodicResync();
+            lifecycle.registerWatch();
+        } catch (RuntimeException | Error startupFailure) {
+            close();        // roll back: do not leave the app stuck in STARTED
+            throw startupFailure;
+        }
     }
 
     /**

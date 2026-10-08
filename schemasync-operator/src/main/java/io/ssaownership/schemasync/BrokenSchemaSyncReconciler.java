@@ -35,6 +35,7 @@ public final class BrokenSchemaSyncReconciler {
 
     /** Reconcile: (wrongly) server-side-apply the spec, co-owning spec.schemaVersion. */
     public void reconcile(String name) {
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
         SchemaBinding current = client.resources(SchemaBinding.class)
                 .inNamespace(namespace).withName(name).get();
         if (current == null) return;

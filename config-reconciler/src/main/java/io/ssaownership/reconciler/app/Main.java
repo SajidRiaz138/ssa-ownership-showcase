@@ -32,40 +32,47 @@ public final class Main {
         String key = env("OWNED_KEY", "message");
 
         KubernetesClient client = new KubernetesClientBuilder().build();
-        String ns = Optional.ofNullable(env("NAMESPACE", null))
-                .orElseGet(() -> Optional.ofNullable(client.getNamespace()).orElse("default"));
-        LOG.info("config-reconciler starting in namespace {}", ns);
-
-        ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key);
-        CountDownLatch stop = new CountDownLatch(1);        // "please begin shutdown"
-        CountDownLatch cleanupDone = new CountDownLatch(1); // "cleanup finished"
-
-        Thread hook = new Thread(() -> {
-            stop.countDown();                               // ask main to begin cleanup
-            try {
-                // wait, with a bound, for the main thread to finish closing app + client, so the
-                // JVM does not exit mid-cleanup.
-                if (!cleanupDone.await(SHUTDOWN_BUDGET_SECONDS, TimeUnit.SECONDS)) {
-                    LOG.warn("shutdown budget elapsed before cleanup completed");
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }, "shutdown");
-        Runtime.getRuntime().addShutdownHook(hook);
-
+        boolean started = false;
         try {
-            app.start();
-            stop.await();                                   // block until SIGTERM (hook) or error
-            LOG.info("shutting down");
-        } finally {
-            // single, idempotent cleanup path shared by normal exit and SIGTERM:
+            String ns = Optional.ofNullable(env("NAMESPACE", null))
+                    .orElseGet(() -> Optional.ofNullable(client.getNamespace()).orElse("default"));
+            LOG.info("config-reconciler starting in namespace {}", ns);
+
+            // If construction throws, the outer finally still closes the client.
+            ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key);
+            CountDownLatch stop = new CountDownLatch(1);        // "please begin shutdown"
+            CountDownLatch cleanupDone = new CountDownLatch(1); // "app + client cleanup finished"
+
+            Thread hook = new Thread(() -> {
+                stop.countDown();                               // ask main to begin cleanup
+                try {
+                    if (!cleanupDone.await(SHUTDOWN_BUDGET_SECONDS, TimeUnit.SECONDS)) {
+                        LOG.warn("shutdown budget elapsed before cleanup completed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "shutdown");
+            Runtime.getRuntime().addShutdownHook(hook);
+
+            started = true;
             try {
-                app.close();                                // bounded; awaits worker/recovery termination
+                app.start();
+                stop.await();                                   // block until SIGTERM (hook) or error
+                LOG.info("shutting down");
             } finally {
-                client.close();                             // kept open until app work finished
-                cleanupDone.countDown();                    // release the hook
+                // ordered cleanup: app -> client -> release the hook (so the JVM does not exit
+                // between releasing the hook and closing the client).
+                try {
+                    app.close();                                // bounded; awaits worker/recovery termination
+                } finally {
+                    client.close();
+                    cleanupDone.countDown();
+                }
             }
+        } finally {
+            // Construction (or pre-start) failure: close the client, which the normal path already did.
+            if (!started) client.close();
         }
     }
 

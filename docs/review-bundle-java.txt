@@ -1,7 +1,7 @@
 ================================================================================
  SSA OWNERSHIP SHOWCASE — ALL JAVA SOURCES AND TESTS (review bundle)
- Generated: 2026-10-08T13:53:27Z   Author: Sajid Riaz
- 27 files. Order: alphabetical by path within each module.
+ Generated: 2026-10-08T14:06:04Z   Author: Sajid Riaz
+ 27 files. Order: alphabetical by path.
 ================================================================================
 
 /* ============================================================================
@@ -87,10 +87,10 @@ public final class ConfigReconcilerApp implements AutoCloseable {
                                String sourceConfigMap, String targetConfigMap, String key,
                                Duration retryDelay, Duration resyncInterval) {
         this.client = Objects.requireNonNull(client, "client");
-        this.namespace = Objects.requireNonNull(namespace, "namespace");
-        this.sourceConfigMap = Objects.requireNonNull(sourceConfigMap, "sourceConfigMap");
-        this.targetConfigMap = Objects.requireNonNull(targetConfigMap, "targetConfigMap");
-        this.key = Objects.requireNonNull(key, "key");
+        this.namespace = requireNonBlank(namespace, "namespace");
+        this.sourceConfigMap = requireNonBlank(sourceConfigMap, "sourceConfigMap");
+        this.targetConfigMap = requireNonBlank(targetConfigMap, "targetConfigMap");
+        this.key = requireNonBlank(key, "key");
 
         // Create executors as LOCALS and only publish them (and the composed dependencies) after
         // all construction succeeds, shutting them down if any later step throws — so a failed
@@ -117,10 +117,30 @@ public final class ConfigReconcilerApp implements AutoCloseable {
         return r -> { Thread t = new Thread(r, name); t.setDaemon(true); return t; };
     }
 
+    private static String requireNonBlank(String v, String what) {
+        Objects.requireNonNull(v, what);
+        if (v.isBlank()) throw new IllegalArgumentException(what + " must not be blank");
+        return v;
+    }
+
+    /**
+     * Derive the value to enforce from the SOURCE ConfigMap's {@code desired} key.
+     *
+     * <p><b>Missing-source policy (deliberate).</b> If the source ConfigMap is absent, has no data,
+     * or lacks the {@code desired} key, this throws — the reconcile pass becomes
+     * {@link Reconciler.Outcome#FAILED}, which performs NO write and therefore PRESERVES the
+     * current target value. This is intentional: an accidental source deletion must NOT cause the
+     * target to be overwritten with a fabricated default. (If a default were desired for a truly
+     * absent source, that would be a different, explicit policy.)
+     */
     private String deriveFromSource() {
         ConfigMap src = client.configMaps().inNamespace(namespace).withName(sourceConfigMap).get();
         String desired = (src != null && src.getData() != null) ? src.getData().get("desired") : null;
-        return desired != null ? desired : "derived-default";
+        if (desired == null) {
+            throw new IllegalStateException("source " + sourceConfigMap
+                    + " missing or has no 'desired' key; preserving target (reconcile FAILED)");
+        }
+        return desired;
     }
 
     /**
@@ -175,8 +195,13 @@ public final class ConfigReconcilerApp implements AutoCloseable {
             throw new IllegalStateException("start() is one-time; current state=" + lifeState.get());
         }
         LOG.info("starting; source={} target={}.{}", sourceConfigMap, targetConfigMap, key);
-        coordinator.startPeriodicResync();
-        lifecycle.registerWatch();
+        try {
+            coordinator.startPeriodicResync();
+            lifecycle.registerWatch();
+        } catch (RuntimeException | Error startupFailure) {
+            close();        // roll back: do not leave the app stuck in STARTED
+            throw startupFailure;
+        }
     }
 
     /**
@@ -253,40 +278,47 @@ public final class Main {
         String key = env("OWNED_KEY", "message");
 
         KubernetesClient client = new KubernetesClientBuilder().build();
-        String ns = Optional.ofNullable(env("NAMESPACE", null))
-                .orElseGet(() -> Optional.ofNullable(client.getNamespace()).orElse("default"));
-        LOG.info("config-reconciler starting in namespace {}", ns);
-
-        ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key);
-        CountDownLatch stop = new CountDownLatch(1);        // "please begin shutdown"
-        CountDownLatch cleanupDone = new CountDownLatch(1); // "cleanup finished"
-
-        Thread hook = new Thread(() -> {
-            stop.countDown();                               // ask main to begin cleanup
-            try {
-                // wait, with a bound, for the main thread to finish closing app + client, so the
-                // JVM does not exit mid-cleanup.
-                if (!cleanupDone.await(SHUTDOWN_BUDGET_SECONDS, TimeUnit.SECONDS)) {
-                    LOG.warn("shutdown budget elapsed before cleanup completed");
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }, "shutdown");
-        Runtime.getRuntime().addShutdownHook(hook);
-
+        boolean started = false;
         try {
-            app.start();
-            stop.await();                                   // block until SIGTERM (hook) or error
-            LOG.info("shutting down");
-        } finally {
-            // single, idempotent cleanup path shared by normal exit and SIGTERM:
+            String ns = Optional.ofNullable(env("NAMESPACE", null))
+                    .orElseGet(() -> Optional.ofNullable(client.getNamespace()).orElse("default"));
+            LOG.info("config-reconciler starting in namespace {}", ns);
+
+            // If construction throws, the outer finally still closes the client.
+            ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key);
+            CountDownLatch stop = new CountDownLatch(1);        // "please begin shutdown"
+            CountDownLatch cleanupDone = new CountDownLatch(1); // "app + client cleanup finished"
+
+            Thread hook = new Thread(() -> {
+                stop.countDown();                               // ask main to begin cleanup
+                try {
+                    if (!cleanupDone.await(SHUTDOWN_BUDGET_SECONDS, TimeUnit.SECONDS)) {
+                        LOG.warn("shutdown budget elapsed before cleanup completed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "shutdown");
+            Runtime.getRuntime().addShutdownHook(hook);
+
+            started = true;
             try {
-                app.close();                                // bounded; awaits worker/recovery termination
+                app.start();
+                stop.await();                                   // block until SIGTERM (hook) or error
+                LOG.info("shutting down");
             } finally {
-                client.close();                             // kept open until app work finished
-                cleanupDone.countDown();                    // release the hook
+                // ordered cleanup: app -> client -> release the hook (so the JVM does not exit
+                // between releasing the hook and closing the client).
+                try {
+                    app.close();                                // bounded; awaits worker/recovery termination
+                } finally {
+                    client.close();
+                    cleanupDone.countDown();
+                }
             }
+        } finally {
+            // Construction (or pre-start) failure: close the client, which the normal path already did.
+            if (!started) client.close();
         }
     }
 
@@ -408,16 +440,20 @@ public final class ReconcileCoordinator implements AutoCloseable {
 
     /** Start periodic resync. Call once after construction. */
     public void startPeriodicResync() {
+        boolean report = false;
+        RejectedExecutionException rejection = null;
         lock.lock();
         try {
             if (state == State.CLOSED || resyncHandle != null) return;
             resyncHandle = executor.scheduleWithFixedDelay(this::trigger,
                     resyncIntervalMs, resyncIntervalMs, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException rej) {
-            handleRejection(rej);
+            report = (state != State.CLOSED);
+            rejection = rej;
         } finally {
             lock.unlock();
         }
+        if (report) reportUnexpectedRejection(rejection);
     }
 
     /**
@@ -458,12 +494,18 @@ public final class ReconcileCoordinator implements AutoCloseable {
         try {
             executor.execute(this::drain);
         } catch (RejectedExecutionException rej) {
+            boolean report;
             lock.lock();
             try {
-                if (state != State.CLOSED) { state = State.IDLE; handleRejection(rej); }
+                report = (state != State.CLOSED);
+                if (report) {
+                    state = State.IDLE;
+                    dirty = false;      // the never-submitted work's dirty flag must not leak forward
+                }
             } finally {
                 lock.unlock();
             }
+            if (report) reportUnexpectedRejection(rej);
         }
     }
 
@@ -516,15 +558,15 @@ public final class ReconcileCoordinator implements AutoCloseable {
         try {
             handle = executor.schedule(() -> runRetry(token), retryDelayMs, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException rej) {
+            boolean report;
             lock.lock();
             try {
-                if (state == State.RETRY_PENDING && retryToken == token) {
-                    state = State.IDLE;
-                    handleRejection(rej);
-                }
+                report = (state == State.RETRY_PENDING && retryToken == token);
+                if (report) state = State.IDLE;
             } finally {
                 lock.unlock();
             }
+            if (report) reportUnexpectedRejection(rej);
             return;
         }
         boolean stale;
@@ -552,11 +594,27 @@ public final class ReconcileCoordinator implements AutoCloseable {
         drain();
     }
 
-    /** Must be called while holding the lock (open state only). */
-    private void handleRejection(RejectedExecutionException rej) {
-        onUnexpectedRejection.accept(rej);
+    /** Invoke the unexpected-rejection observer OUTSIDE the lock, never letting it escape. */
+    private void reportUnexpectedRejection(RejectedExecutionException rej) {
+        try {
+            onUnexpectedRejection.accept(rej);
+        } catch (RuntimeException observerFailure) {
+            LOG.error("unexpected-rejection observer failed", observerFailure);
+        }
     }
 
+    /**
+     * Terminal shutdown. Invalidates the retry token and cancels both the retry and resync handles
+     * (outside the lock).
+     *
+     * <p><b>Guarantee (precise).</b> {@code close()} prevents any queued retry or drain that has
+     * NOT yet passed its execution-eligibility check (the state/token guard at the top of
+     * {@code drain()} / {@code runRetry}) from calling the engine. A pass that has ALREADY crossed
+     * that guard is considered in flight and may run to completion — {@code close()} does NOT by
+     * itself wait for active reconciliation. The application's shutdown ({@code ConfigReconcilerApp
+     * .close()}) is what awaits worker-executor termination, so an admitted pass finishes before
+     * application cleanup returns.
+     */
     @Override
     public void close() {
         ScheduledFuture<?> retry;
@@ -659,6 +717,8 @@ public final class KubeConfigMapStore implements ConfigMapStore {
 
     @Override
     public Optional<String> get(String configMap, String key) {
+        requireName(configMap, "configMap");
+        requireName(key, "key");
         final ConfigMap cm;
         try {
             cm = client.configMaps().inNamespace(namespace).withName(configMap).get();
@@ -673,6 +733,8 @@ public final class KubeConfigMapStore implements ConfigMapStore {
 
     @Override
     public void upsert(String configMap, String key, String value) {
+        requireName(configMap, "configMap");
+        requireName(key, "key");
         Objects.requireNonNull(value, "value");
         try {
             ConfigMap cm = require(configMap);  // must exist (do not create)
@@ -688,6 +750,8 @@ public final class KubeConfigMapStore implements ConfigMapStore {
 
     @Override
     public boolean putIfAbsent(String configMap, String key, String value) {
+        requireName(configMap, "configMap");
+        requireName(key, "key");
         Objects.requireNonNull(value, "value");
         KubernetesClientException last = null;
         for (int attempt = 0; attempt <= maxConflictRetries; attempt++) {
@@ -721,6 +785,11 @@ public final class KubeConfigMapStore implements ConfigMapStore {
         }
         throw new StoreException("putIfAbsent " + configMap + "." + key
                 + " exhausted conflict retries", last);
+    }
+
+    private static void requireName(String v, String what) {
+        Objects.requireNonNull(v, what);
+        if (v.isBlank()) throw new IllegalArgumentException(what + " must not be blank");
     }
 
     private ConfigMap require(String configMap) {
@@ -828,6 +897,24 @@ class ConfigReconcilerAppIT {
                     .edit(c -> new ConfigMapBuilder(c).addToData(key, "tampered").build());
             app.triggerNow();
             assertTrue(await(() -> "v2".equals(targetValue()), 20), "a triggered pass must repair drift to v2, was " + targetValue());
+        }
+    }
+
+    @Test @Timeout(60)
+    void missing_source_preserves_the_target_and_does_not_clobber_with_a_default() throws Exception {
+        // Policy: a missing source must NOT overwrite the target with a fabricated default. After
+        // the app has enforced v1, delete the source entirely; subsequent passes must FAIL and
+        // leave the last enforced value intact.
+        try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key,
+                Duration.ofSeconds(1), Duration.ofSeconds(1))) {
+            app.start();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20), "initial enforce v1, was " + targetValue());
+
+            client.configMaps().inNamespace(ns).withName(source).delete();   // accidental source loss
+            // Give periodic resync several cycles; the target must remain v1 (never a default).
+            Thread.sleep(3000);
+            assertEquals("v1", targetValue(),
+                    "missing source must preserve the last enforced target value, not clobber it");
         }
     }
 
@@ -967,8 +1054,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Deterministic unit tests for {@link ReconcileCoordinator}. A real {@link Reconciler} is driven
  * over a controllable in-test {@link ConfigMapStore}; a real single-thread scheduled executor
- * serialises drains. Latches signal pass ENTRY and SETTLEMENT — no spin loops, no sleeps as
- * correctness evidence.
+ * serialises drains. Latches signal pass ENTRY and the key interleavings; a couple of helpers
+ * bounded-poll a state flag with a short sleep purely to await settlement/termination — never as
+ * the correctness assertion itself, which is always a latch, a count, or a state check.
  */
 class ReconcileCoordinatorTest {
 
@@ -1120,6 +1208,125 @@ class ReconcileCoordinatorTest {
         exec.shutdownNow();
         assertDoesNotThrow(coord::trigger,
                 "a trigger must swallow executor rejection (never throw back into a watch callback)");
+    }
+
+    // ---- duration validation / normalization -------------------------------------------------
+
+    @Test @Timeout(10)
+    void durations_are_validated_and_normalized() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, new ControllableStore(), () -> "d");
+        assertThrows(IllegalArgumentException.class,
+                () -> new ReconcileCoordinator(r, exec, Duration.ZERO, Duration.ofSeconds(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMillis(-1)));
+        IllegalArgumentException ov = assertThrows(IllegalArgumentException.class,
+                () -> new ReconcileCoordinator(r, exec, Duration.ofSeconds(Long.MAX_VALUE), Duration.ofSeconds(1)));
+        assertTrue(ov.getMessage().contains("retryDelay"), "overflow names retryDelay: " + ov.getMessage());
+        assertDoesNotThrow(() -> new ReconcileCoordinator(r, exec, Duration.ofNanos(1), Duration.ofNanos(1)));
+    }
+
+    @Test @Timeout(10)
+    void sub_millisecond_resync_is_normalized_and_actually_schedules() throws Exception {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(10), Duration.ofNanos(1));
+        CountDownLatch entered = new CountDownLatch(1);
+        store.entered = entered;
+        coord.startPeriodicResync();                       // 0ms would be rejected; 1ms must run
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "normalized sub-ms resync must actually run a pass");
+    }
+
+    // ---- unexpected-rejection observer -------------------------------------------------------
+
+    @Test @Timeout(10)
+    void unexpected_rejection_while_open_invokes_observer_exactly_once() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        AtomicInteger observed = new AtomicInteger();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMinutes(10),
+                rej -> observed.incrementAndGet());
+        exec.shutdownNow();                                // executor dies unexpectedly, coordinator OPEN
+        coord.trigger();
+        assertEquals(1, observed.get(), "unexpected rejection while open invokes the observer exactly once");
+    }
+
+    @Test @Timeout(10)
+    void rejection_after_close_does_not_invoke_the_observer() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        AtomicInteger observed = new AtomicInteger();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMinutes(10),
+                rej -> observed.incrementAndGet());
+        coord.close();
+        exec.shutdownNow();
+        coord.trigger();
+        assertEquals(0, observed.get(), "a rejection after close must not invoke the observer");
+    }
+
+    @Test @Timeout(10)
+    void a_throwing_observer_does_not_escape_through_trigger() {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, exec, Duration.ofSeconds(1), Duration.ofMinutes(10),
+                rej -> { throw new RuntimeException("observer blew up"); });
+        exec.shutdownNow();
+        assertDoesNotThrow(coord::trigger, "a throwing observer must not escape through trigger()");
+        assertDoesNotThrow(coord::trigger, "state remains consistent after an observer failure");
+    }
+
+    // ---- pending-retry handle cancellation (recording scheduled executor) --------------------
+
+    @Test @Timeout(10)
+    void close_cancels_the_actual_retry_future_and_a_stale_run_does_nothing() throws Exception {
+        RecordingScheduledExecutor rec = new RecordingScheduledExecutor();
+        exec = rec;
+        store = new ControllableStore();
+        store.failNext = true;
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "d");
+        coord = new ReconcileCoordinator(r, rec, Duration.ofSeconds(5), Duration.ofMinutes(10));
+
+        coord.trigger();                                   // execute() runs inline -> first pass FAILED
+        assertTrue(coord.debugRetryPending(), "retry pending after FAILED");
+        RecordingScheduledExecutor.RecordedFuture retry = rec.lastScheduled();
+        assertNotNull(retry, "a retry future was scheduled");
+        long token = coord.debugRetryToken();
+
+        coord.close();
+        assertTrue(retry.cancelled.get(), "close must cancel the ACTUAL retry future");
+        int before = store.passes.get();
+        coord.debugRunRetry(token);                        // run the stale retry body deliberately
+        assertEquals(before, store.passes.get(), "a stale/canceled retry performs no reconcile");
+    }
+
+    /** Scheduled executor that runs execute() inline and records schedule() calls with cancelable,
+     *  non-auto-running futures — so a test can assert cancellation and run stale bodies by hand. */
+    static final class RecordingScheduledExecutor extends java.util.concurrent.ScheduledThreadPoolExecutor {
+        RecordingScheduledExecutor() { super(1); }
+        private volatile RecordedFuture last;
+        RecordedFuture lastScheduled() { return last; }
+
+        @Override public void execute(Runnable command) { command.run(); }   // inline, deterministic
+        @Override public java.util.concurrent.ScheduledFuture<?> schedule(
+                Runnable command, long delay, TimeUnit unit) {
+            RecordedFuture f = new RecordedFuture();
+            last = f;
+            return f;                                      // do NOT run; the test drives it
+        }
+        static final class RecordedFuture implements java.util.concurrent.ScheduledFuture<Object> {
+            final java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+            @Override public long getDelay(TimeUnit u) { return 0; }
+            @Override public int compareTo(java.util.concurrent.Delayed o) { return 0; }
+            @Override public boolean cancel(boolean i) { cancelled.set(true); return true; }
+            @Override public boolean isCancelled() { return cancelled.get(); }
+            @Override public boolean isDone() { return cancelled.get(); }
+            @Override public Object get() { return null; }
+            @Override public Object get(long t, TimeUnit u) { return null; }
+        }
     }
 
     // ---- helpers ----
@@ -3597,6 +3804,7 @@ public final class BrokenSchemaSyncReconciler {
 
     /** Reconcile: (wrongly) server-side-apply the spec, co-owning spec.schemaVersion. */
     public void reconcile(String name) {
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
         SchemaBinding current = client.resources(SchemaBinding.class)
                 .inNamespace(namespace).withName(name).get();
         if (current == null) return;
@@ -3676,6 +3884,7 @@ public final class FixedSchemaSyncReconciler {
 
     /** Reconcile: write ONLY status.observedSchemaVersion (never spec). */
     public void reconcile(String name) {
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
         SchemaBinding current = client.resources(SchemaBinding.class)
                 .inNamespace(namespace).withName(name).get();
         if (current == null) return;
@@ -3704,6 +3913,7 @@ public final class FixedSchemaSyncReconciler {
      * demonstration test asserts the value is preserved precisely because the chart co-owns it.
      */
     public void releaseStaleSpecOwnership(String name) {
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
         SchemaBinding emptyApply = new SchemaBinding();
         emptyApply.getMetadata().setName(name);
         // No spec set -> this manager, after this apply, owns no spec fields.
@@ -3933,12 +4143,15 @@ class SchemaSyncOwnershipIT {
                 .toList();
     }
 
+    private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+
     /** Serialize an entry's fieldsV1 to a JSON tree for structured path inspection. */
     private com.fasterxml.jackson.databind.JsonNode fieldsTree(ManagedFieldsEntry e) {
         try {
             Object props = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
             String json = io.fabric8.kubernetes.client.utils.Serialization.asJson(props == null ? java.util.Map.of() : props);
-            return new com.fasterxml.jackson.databind.ObjectMapper().readTree(json);
+            return MAPPER.readTree(json);
         } catch (Exception ex) {
             throw new AssertionError("failed to parse managedFields fieldsV1", ex);
         }

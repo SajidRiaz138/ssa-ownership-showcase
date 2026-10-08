@@ -150,12 +150,15 @@ class SchemaSyncOwnershipIT {
                 .toList();
     }
 
+    private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+
     /** Serialize an entry's fieldsV1 to a JSON tree for structured path inspection. */
     private com.fasterxml.jackson.databind.JsonNode fieldsTree(ManagedFieldsEntry e) {
         try {
             Object props = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
             String json = io.fabric8.kubernetes.client.utils.Serialization.asJson(props == null ? java.util.Map.of() : props);
-            return new com.fasterxml.jackson.databind.ObjectMapper().readTree(json);
+            return MAPPER.readTree(json);
         } catch (Exception ex) {
             throw new AssertionError("failed to parse managedFields fieldsV1", ex);
         }

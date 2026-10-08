@@ -38,12 +38,12 @@ All tests, by class (surefire = unit, failsafe = `*IT` integration):
 | `ReconcilerTest` | unit | 15 |
 | `ExecutorRecoverySchedulerTest` | unit | 4 |
 | `ExecutorRecoverySchedulerIT` | IT | 6 |
-| `ReconcileCoordinatorTest` | unit | 6 |
+| `ReconcileCoordinatorTest` | unit | 12 |
 | `ConfigReconcilerAppWatchLeakTest` | unit | 3 |
-| `ConfigReconcilerAppIT` | IT (cluster) | 3 |
+| `ConfigReconcilerAppIT` | IT (cluster) | 4 |
 | `KubeConfigMapStoreIT` | IT (cluster) | 10 |
 | `SchemaSyncOwnershipIT` | IT (cluster) | 3 |
-| **Total** | | **74** |
+| **Total** | | **81** |
 
 > Count is from the committed revision's failsafe/surefire reports under `-Plive-it`.
 
@@ -62,11 +62,11 @@ review. Only the two mutation rows are DEMO.
 
 reconciler-core  : WatchLifecycleTest 24, ReconcilerTest 15, ExecutorRecoverySchedulerTest 4  (unit)
                    ExecutorRecoverySchedulerIT 6                                               (IT)
-config-reconciler: ReconcileCoordinatorTest 6, ConfigReconcilerAppWatchLeakTest 3             (unit)
-                   ConfigReconcilerAppIT 3, KubeConfigMapStoreIT 10                            (IT, cluster)
+config-reconciler: ReconcileCoordinatorTest 12, ConfigReconcilerAppWatchLeakTest 3             (unit)
+                   ConfigReconcilerAppIT 4, KubeConfigMapStoreIT 10                            (IT, cluster)
 schemasync-operator: SchemaSyncOwnershipIT 3                                                  (IT, cluster)
 Reactor: all SUCCESS
-BUILD SUCCESS   (74 tests, 0 failures, 0 errors, 0 skipped)
+BUILD SUCCESS   (81 tests, 0 failures, 0 errors, 0 skipped)
 ```
 
 ### C.2 Mutation 1 — no-op `cancel()` (ExecutorRecoveryScheduler)

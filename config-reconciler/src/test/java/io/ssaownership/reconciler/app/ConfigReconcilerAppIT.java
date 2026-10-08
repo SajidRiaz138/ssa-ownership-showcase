@@ -93,6 +93,24 @@ class ConfigReconcilerAppIT {
     }
 
     @Test @Timeout(60)
+    void missing_source_preserves_the_target_and_does_not_clobber_with_a_default() throws Exception {
+        // Policy: a missing source must NOT overwrite the target with a fabricated default. After
+        // the app has enforced v1, delete the source entirely; subsequent passes must FAIL and
+        // leave the last enforced value intact.
+        try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key,
+                Duration.ofSeconds(1), Duration.ofSeconds(1))) {
+            app.start();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20), "initial enforce v1, was " + targetValue());
+
+            client.configMaps().inNamespace(ns).withName(source).delete();   // accidental source loss
+            // Give periodic resync several cycles; the target must remain v1 (never a default).
+            Thread.sleep(3000);
+            assertEquals("v1", targetValue(),
+                    "missing source must preserve the last enforced target value, not clobber it");
+        }
+    }
+
+    @Test @Timeout(60)
     void periodic_resync_repairs_target_drift_autonomously() throws Exception {
         // AUTONOMOUS enforcement: with a short resync interval, target-only drift (which the
         // source watch never observes) is repaired by the coordinator's periodic resync — no

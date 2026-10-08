@@ -30,6 +30,22 @@ Introduce `ReconcileCoordinator` between event sources and `Reconciler` (the eng
   swallows executor rejection, so a late watch callback never throws `RejectedExecutionException`
   back into fabric8.
 
+<b>Lock discipline.</b> The unexpected-rejection observer (an infrastructure callback) is invoked
+OUTSIDE the coordinator lock and wrapped so a throwing observer cannot escape or re-enter under the
+lock. Under the lock only the state transition happens (and, on a rejected immediate submit, the
+stale `dirty` flag is cleared so it cannot leak forward to a later trigger).
+
+<b>Close guarantee (precise).</b> `close()` invalidates the retry token and cancels the retry/resync
+handles outside the lock. It prevents any queued retry/drain that has NOT passed its
+state/token eligibility check from reaching the engine; a pass already admitted may complete.
+`close()` alone does NOT wait for an in-flight pass — `ConfigReconcilerApp.close()` awaits
+worker-executor termination for that.
+
+<b>Missing-source policy.</b> `deriveFromSource` THROWS when the source ConfigMap is absent, has no
+data, or lacks the `desired` key, making the pass `FAILED` and performing no write — the current
+target value is PRESERVED. An accidental source deletion must not overwrite the target with a
+fabricated default. (`missing_source_preserves_the_target...` asserts this on a live cluster.)
+
 Watch acquisition is leak-safe: `createThenSetup` closes the created watch (suppressing any close
 error) if post-creation setup throws, because the lifecycle never received the handle.
 

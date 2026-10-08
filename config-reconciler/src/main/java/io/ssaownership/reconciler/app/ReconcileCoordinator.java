@@ -105,16 +105,20 @@ public final class ReconcileCoordinator implements AutoCloseable {
 
     /** Start periodic resync. Call once after construction. */
     public void startPeriodicResync() {
+        boolean report = false;
+        RejectedExecutionException rejection = null;
         lock.lock();
         try {
             if (state == State.CLOSED || resyncHandle != null) return;
             resyncHandle = executor.scheduleWithFixedDelay(this::trigger,
                     resyncIntervalMs, resyncIntervalMs, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException rej) {
-            handleRejection(rej);
+            report = (state != State.CLOSED);
+            rejection = rej;
         } finally {
             lock.unlock();
         }
+        if (report) reportUnexpectedRejection(rejection);
     }
 
     /**
@@ -155,12 +159,18 @@ public final class ReconcileCoordinator implements AutoCloseable {
         try {
             executor.execute(this::drain);
         } catch (RejectedExecutionException rej) {
+            boolean report;
             lock.lock();
             try {
-                if (state != State.CLOSED) { state = State.IDLE; handleRejection(rej); }
+                report = (state != State.CLOSED);
+                if (report) {
+                    state = State.IDLE;
+                    dirty = false;      // the never-submitted work's dirty flag must not leak forward
+                }
             } finally {
                 lock.unlock();
             }
+            if (report) reportUnexpectedRejection(rej);
         }
     }
 
@@ -213,15 +223,15 @@ public final class ReconcileCoordinator implements AutoCloseable {
         try {
             handle = executor.schedule(() -> runRetry(token), retryDelayMs, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException rej) {
+            boolean report;
             lock.lock();
             try {
-                if (state == State.RETRY_PENDING && retryToken == token) {
-                    state = State.IDLE;
-                    handleRejection(rej);
-                }
+                report = (state == State.RETRY_PENDING && retryToken == token);
+                if (report) state = State.IDLE;
             } finally {
                 lock.unlock();
             }
+            if (report) reportUnexpectedRejection(rej);
             return;
         }
         boolean stale;
@@ -249,11 +259,27 @@ public final class ReconcileCoordinator implements AutoCloseable {
         drain();
     }
 
-    /** Must be called while holding the lock (open state only). */
-    private void handleRejection(RejectedExecutionException rej) {
-        onUnexpectedRejection.accept(rej);
+    /** Invoke the unexpected-rejection observer OUTSIDE the lock, never letting it escape. */
+    private void reportUnexpectedRejection(RejectedExecutionException rej) {
+        try {
+            onUnexpectedRejection.accept(rej);
+        } catch (RuntimeException observerFailure) {
+            LOG.error("unexpected-rejection observer failed", observerFailure);
+        }
     }
 
+    /**
+     * Terminal shutdown. Invalidates the retry token and cancels both the retry and resync handles
+     * (outside the lock).
+     *
+     * <p><b>Guarantee (precise).</b> {@code close()} prevents any queued retry or drain that has
+     * NOT yet passed its execution-eligibility check (the state/token guard at the top of
+     * {@code drain()} / {@code runRetry}) from calling the engine. A pass that has ALREADY crossed
+     * that guard is considered in flight and may run to completion — {@code close()} does NOT by
+     * itself wait for active reconciliation. The application's shutdown ({@code ConfigReconcilerApp
+     * .close()}) is what awaits worker-executor termination, so an admitted pass finishes before
+     * application cleanup returns.
+     */
     @Override
     public void close() {
         ScheduledFuture<?> retry;

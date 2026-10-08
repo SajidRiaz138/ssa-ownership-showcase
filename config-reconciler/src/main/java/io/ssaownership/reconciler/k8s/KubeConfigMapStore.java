@@ -61,6 +61,8 @@ public final class KubeConfigMapStore implements ConfigMapStore {
 
     @Override
     public Optional<String> get(String configMap, String key) {
+        requireName(configMap, "configMap");
+        requireName(key, "key");
         final ConfigMap cm;
         try {
             cm = client.configMaps().inNamespace(namespace).withName(configMap).get();
@@ -75,6 +77,8 @@ public final class KubeConfigMapStore implements ConfigMapStore {
 
     @Override
     public void upsert(String configMap, String key, String value) {
+        requireName(configMap, "configMap");
+        requireName(key, "key");
         Objects.requireNonNull(value, "value");
         try {
             ConfigMap cm = require(configMap);  // must exist (do not create)
@@ -90,6 +94,8 @@ public final class KubeConfigMapStore implements ConfigMapStore {
 
     @Override
     public boolean putIfAbsent(String configMap, String key, String value) {
+        requireName(configMap, "configMap");
+        requireName(key, "key");
         Objects.requireNonNull(value, "value");
         KubernetesClientException last = null;
         for (int attempt = 0; attempt <= maxConflictRetries; attempt++) {
@@ -123,6 +129,11 @@ public final class KubeConfigMapStore implements ConfigMapStore {
         }
         throw new StoreException("putIfAbsent " + configMap + "." + key
                 + " exhausted conflict retries", last);
+    }
+
+    private static void requireName(String v, String what) {
+        Objects.requireNonNull(v, what);
+        if (v.isBlank()) throw new IllegalArgumentException(what + " must not be blank");
     }
 
     private ConfigMap require(String configMap) {
