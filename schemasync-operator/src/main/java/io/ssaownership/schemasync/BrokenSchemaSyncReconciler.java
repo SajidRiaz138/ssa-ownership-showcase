@@ -30,12 +30,12 @@ public final class BrokenSchemaSyncReconciler {
 
     public BrokenSchemaSyncReconciler(KubernetesClient client, String namespace) {
         this.client = java.util.Objects.requireNonNull(client, "client");
-        this.namespace = java.util.Objects.requireNonNull(namespace, "namespace");
+        this.namespace = Names.require(namespace, "namespace");
     }
 
     /** Reconcile: (wrongly) server-side-apply the spec, co-owning spec.schemaVersion. */
     public void reconcile(String name) {
-        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+        Names.require(name, "name");
         SchemaBinding current = client.resources(SchemaBinding.class)
                 .inNamespace(namespace).withName(name).get();
         if (current == null) return;

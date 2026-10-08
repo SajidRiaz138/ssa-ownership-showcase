@@ -40,10 +40,11 @@ All tests, by class (surefire = unit, failsafe = `*IT` integration):
 | `ExecutorRecoverySchedulerIT` | IT | 6 |
 | `ReconcileCoordinatorTest` | unit | 12 |
 | `ConfigReconcilerAppWatchLeakTest` | unit | 3 |
+| `ConfigReconcilerAppLifecycleTest` | unit | 4 |
 | `ConfigReconcilerAppIT` | IT (cluster) | 4 |
 | `KubeConfigMapStoreIT` | IT (cluster) | 10 |
 | `SchemaSyncOwnershipIT` | IT (cluster) | 3 |
-| **Total** | | **81** |
+| **Total** | | **85** |
 
 > Count is from the committed revision's failsafe/surefire reports under `-Plive-it`.
 
@@ -66,7 +67,7 @@ config-reconciler: ReconcileCoordinatorTest 12, ConfigReconcilerAppWatchLeakTest
                    ConfigReconcilerAppIT 4, KubeConfigMapStoreIT 10                            (IT, cluster)
 schemasync-operator: SchemaSyncOwnershipIT 3                                                  (IT, cluster)
 Reactor: all SUCCESS
-BUILD SUCCESS   (81 tests, 0 failures, 0 errors, 0 skipped)
+BUILD SUCCESS   (85 tests, 0 failures, 0 errors, 0 skipped)
 ```
 
 ### C.2 Mutation 1 — no-op `cancel()` (ExecutorRecoveryScheduler)

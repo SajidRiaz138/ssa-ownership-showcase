@@ -1,7 +1,7 @@
 ================================================================================
  SSA OWNERSHIP SHOWCASE — ALL JAVA SOURCES AND TESTS (review bundle)
- Generated: 2026-10-08T14:06:04Z   Author: Sajid Riaz
- 27 files. Order: alphabetical by path.
+ Generated: 2026-10-08T14:16:05Z   Author: Sajid Riaz
+ 29 files. Order: alphabetical by path.
 ================================================================================
 
 /* ============================================================================
@@ -278,47 +278,51 @@ public final class Main {
         String key = env("OWNED_KEY", "message");
 
         KubernetesClient client = new KubernetesClientBuilder().build();
-        boolean started = false;
         try {
             String ns = Optional.ofNullable(env("NAMESPACE", null))
                     .orElseGet(() -> Optional.ofNullable(client.getNamespace()).orElse("default"));
             LOG.info("config-reconciler starting in namespace {}", ns);
 
-            // If construction throws, the outer finally still closes the client.
+            // Ownership of `app` begins the instant construction succeeds: EVERY later path —
+            // including addShutdownHook() throwing (shutdown already in progress, or a security
+            // manager) — must close it. So the app is owned by its own try/finally that wraps hook
+            // registration and start.
             ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key);
             CountDownLatch stop = new CountDownLatch(1);        // "please begin shutdown"
             CountDownLatch cleanupDone = new CountDownLatch(1); // "app + client cleanup finished"
-
-            Thread hook = new Thread(() -> {
-                stop.countDown();                               // ask main to begin cleanup
-                try {
-                    if (!cleanupDone.await(SHUTDOWN_BUDGET_SECONDS, TimeUnit.SECONDS)) {
-                        LOG.warn("shutdown budget elapsed before cleanup completed");
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }, "shutdown");
-            Runtime.getRuntime().addShutdownHook(hook);
-
-            started = true;
             try {
+                Thread hook = new Thread(() -> {
+                    stop.countDown();                           // ask main to begin cleanup
+                    try {
+                        if (!cleanupDone.await(SHUTDOWN_BUDGET_SECONDS, TimeUnit.SECONDS)) {
+                            LOG.warn("shutdown budget elapsed before cleanup completed");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }, "shutdown");
+                Runtime.getRuntime().addShutdownHook(hook);     // if THIS throws, finally still closes app
+
                 app.start();
                 stop.await();                                   // block until SIGTERM (hook) or error
                 LOG.info("shutting down");
             } finally {
-                // ordered cleanup: app -> client -> release the hook (so the JVM does not exit
-                // between releasing the hook and closing the client).
+                // Nested cleanup so a client.close() failure cannot skip cleanupDone (which would
+                // make the hook wait out its full budget). Order: app -> client -> release hook.
                 try {
                     app.close();                                // bounded; awaits worker/recovery termination
                 } finally {
-                    client.close();
-                    cleanupDone.countDown();
+                    try {
+                        client.close();
+                    } finally {
+                        cleanupDone.countDown();
+                    }
                 }
             }
         } finally {
-            // Construction (or pre-start) failure: close the client, which the normal path already did.
-            if (!started) client.close();
+            // If app construction threw, the inner block never ran; ensure the client is closed.
+            // When the inner block ran, client.close() already happened — close() is idempotent.
+            client.close();
         }
     }
 
@@ -403,6 +407,7 @@ public final class ReconcileCoordinator implements AutoCloseable {
     private long retryToken = 0;              // identifies the current RETRY_PENDING reservation
     private ScheduledFuture<?> retryHandle;   // the pending retry's handle (guarded)
     private ScheduledFuture<?> resyncHandle;  // periodic resync handle (guarded)
+    private boolean resyncStarting = false;   // resync startup reserved, scheduling outside lock (guarded)
 
     public ReconcileCoordinator(Reconciler reconciler, ScheduledExecutorService executor,
                                 Duration retryDelay, Duration resyncInterval) {
@@ -440,19 +445,42 @@ public final class ReconcileCoordinator implements AutoCloseable {
 
     /** Start periodic resync. Call once after construction. */
     public void startPeriodicResync() {
-        boolean report = false;
-        RejectedExecutionException rejection = null;
+        // Reserve startup under the lock; schedule OUTSIDE the lock (consistent with the rule that
+        // infrastructure calls never happen under the coordinator lock); publish the handle only
+        // if still current.
         lock.lock();
         try {
-            if (state == State.CLOSED || resyncHandle != null) return;
-            resyncHandle = executor.scheduleWithFixedDelay(this::trigger,
-                    resyncIntervalMs, resyncIntervalMs, TimeUnit.MILLISECONDS);
-        } catch (RejectedExecutionException rej) {
-            report = (state != State.CLOSED);
-            rejection = rej;
+            if (state == State.CLOSED || resyncStarting || resyncHandle != null) return;
+            resyncStarting = true;
         } finally {
             lock.unlock();
         }
+
+        ScheduledFuture<?> handle = null;
+        RejectedExecutionException rejection = null;
+        try {
+            handle = executor.scheduleWithFixedDelay(this::trigger,
+                    resyncIntervalMs, resyncIntervalMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException rej) {
+            rejection = rej;
+        }
+
+        ScheduledFuture<?> toCancel = null;
+        boolean report = false;
+        lock.lock();
+        try {
+            resyncStarting = false;
+            if (rejection != null) {
+                report = (state != State.CLOSED);
+            } else if (state == State.CLOSED) {
+                toCancel = handle;        // closed while scheduling -> drop the late handle
+            } else {
+                resyncHandle = handle;    // publish
+            }
+        } finally {
+            lock.unlock();
+        }
+        cancelOutsideLock(toCancel);
         if (report) reportUnexpectedRejection(rejection);
     }
 
@@ -965,7 +993,97 @@ class ConfigReconcilerAppIT {
 
 
 /* ============================================================================
- * FILE 06: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ConfigReconcilerAppWatchLeakTest.java
+ * FILE 06: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ConfigReconcilerAppLifecycleTest.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.app;
+
+import io.fabric8.kubernetes.client.ConfigBuilder;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.time.Duration;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Application lifecycle contract tests for {@link ConfigReconcilerApp}, with NO live cluster.
+ * These assert the state-machine contract (one-time start, start-after-close rejected, idempotent
+ * close) independently of any cluster, using a client pointed at an unroutable endpoint.
+ *
+ * <p>Note on rollback: {@code start()} wraps resync + watch registration and, on a thrown
+ * {@code RuntimeException|Error}, calls {@code close()} and rethrows. fabric8's {@code watch(...)}
+ * does NOT fail synchronously against an unreachable endpoint (it returns a handle and surfaces
+ * the failure asynchronously via the lifecycle's recovery path), so this unit cannot force a
+ * synchronous start() throw without a production seam. The rollback branch is therefore covered by
+ * source review here; the one-time/idempotent GUARANTEES below are what this test pins
+ * deterministically.
+ */
+class ConfigReconcilerAppLifecycleTest {
+
+    private KubernetesClient client;
+    private ConfigReconcilerApp app;
+
+    private ConfigReconcilerApp newApp() {
+        client = new KubernetesClientBuilder().withConfig(new ConfigBuilder()
+                .withMasterUrl("https://127.0.0.1:1")
+                .withConnectionTimeout(300).withRequestTimeout(300)
+                .withWatchReconnectLimit(0).build()).build();
+        app = new ConfigReconcilerApp(client, "ns", "src", "tgt", "key",
+                Duration.ofSeconds(1), Duration.ofMinutes(10));
+        return app;
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (app != null) app.close();
+        if (client != null) client.close();
+    }
+
+    @Test @Timeout(30)
+    void start_after_close_is_rejected() {
+        newApp();
+        app.close();                                     // NEW -> CLOSED without starting
+        assertThrows(IllegalStateException.class, app::start,
+                "start() after close() must be rejected");
+    }
+
+    @Test @Timeout(30)
+    void repeated_close_is_harmless() {
+        newApp();
+        assertDoesNotThrow(app::close);
+        assertDoesNotThrow(app::close, "a second close() must be a no-op");
+        assertDoesNotThrow(app::close, "and a third");
+    }
+
+    @Test @Timeout(30)
+    void close_without_start_is_harmless() {
+        newApp();
+        assertDoesNotThrow(app::close, "close() on a never-started app must not throw");
+    }
+
+    @Test @Timeout(30)
+    void blank_configuration_is_rejected_at_construction() {
+        try (KubernetesClient c = new KubernetesClientBuilder().withConfig(new ConfigBuilder()
+                .withMasterUrl("https://127.0.0.1:1").build()).build()) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> new ConfigReconcilerApp(c, " ", "src", "tgt", "key"), "blank namespace");
+            assertThrows(IllegalArgumentException.class,
+                    () -> new ConfigReconcilerApp(c, "ns", "", "tgt", "key"), "blank source");
+            assertThrows(IllegalArgumentException.class,
+                    () -> new ConfigReconcilerApp(c, "ns", "src", " ", "key"), "blank target");
+            assertThrows(IllegalArgumentException.class,
+                    () -> new ConfigReconcilerApp(c, "ns", "src", "tgt", ""), "blank key");
+        }
+    }
+}
+
+
+/* ============================================================================
+ * FILE 07: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ConfigReconcilerAppWatchLeakTest.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler.app;
@@ -1028,7 +1146,7 @@ class ConfigReconcilerAppWatchLeakTest {
 
 
 /* ============================================================================
- * FILE 07: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ReconcileCoordinatorTest.java
+ * FILE 08: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ReconcileCoordinatorTest.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler.app;
@@ -1343,7 +1461,7 @@ class ReconcileCoordinatorTest {
 
 
 /* ============================================================================
- * FILE 08: config-reconciler/src/test/java/io/ssaownership/reconciler/k8s/KubeConfigMapStoreIT.java
+ * FILE 09: config-reconciler/src/test/java/io/ssaownership/reconciler/k8s/KubeConfigMapStoreIT.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler.k8s;
@@ -1543,7 +1661,7 @@ class KubeConfigMapStoreIT {
 
 
 /* ============================================================================
- * FILE 09: reconciler-core/src/main/java/io/ssaownership/reconciler/ConfigMapStore.java
+ * FILE 10: reconciler-core/src/main/java/io/ssaownership/reconciler/ConfigMapStore.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -1621,7 +1739,7 @@ public interface ConfigMapStore {
 
 
 /* ============================================================================
- * FILE 10: reconciler-core/src/main/java/io/ssaownership/reconciler/ExecutorRecoveryScheduler.java
+ * FILE 11: reconciler-core/src/main/java/io/ssaownership/reconciler/ExecutorRecoveryScheduler.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -1714,7 +1832,7 @@ public final class ExecutorRecoveryScheduler implements RecoveryScheduler, AutoC
 
 
 /* ============================================================================
- * FILE 11: reconciler-core/src/main/java/io/ssaownership/reconciler/Reconciler.java
+ * FILE 12: reconciler-core/src/main/java/io/ssaownership/reconciler/Reconciler.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -1854,7 +1972,7 @@ public final class Reconciler {
 
 
 /* ============================================================================
- * FILE 12: reconciler-core/src/main/java/io/ssaownership/reconciler/RecoveryScheduler.java
+ * FILE 13: reconciler-core/src/main/java/io/ssaownership/reconciler/RecoveryScheduler.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -1902,7 +2020,7 @@ public interface RecoveryScheduler {
 
 
 /* ============================================================================
- * FILE 13: reconciler-core/src/main/java/io/ssaownership/reconciler/WatchFactory.java
+ * FILE 14: reconciler-core/src/main/java/io/ssaownership/reconciler/WatchFactory.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -1941,7 +2059,7 @@ public interface WatchFactory {
 
 
 /* ============================================================================
- * FILE 14: reconciler-core/src/main/java/io/ssaownership/reconciler/WatchLifecycle.java
+ * FILE 15: reconciler-core/src/main/java/io/ssaownership/reconciler/WatchLifecycle.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -2337,7 +2455,7 @@ public final class WatchLifecycle {
 
 
 /* ============================================================================
- * FILE 15: reconciler-core/src/main/java/io/ssaownership/reconciler/WriteStrategy.java
+ * FILE 16: reconciler-core/src/main/java/io/ssaownership/reconciler/WriteStrategy.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -2376,7 +2494,7 @@ public enum WriteStrategy {
 
 
 /* ============================================================================
- * FILE 16: reconciler-core/src/test/java/io/ssaownership/reconciler/ExecutorRecoverySchedulerIT.java
+ * FILE 17: reconciler-core/src/test/java/io/ssaownership/reconciler/ExecutorRecoverySchedulerIT.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -2531,7 +2649,7 @@ class ExecutorRecoverySchedulerIT {
 
 
 /* ============================================================================
- * FILE 17: reconciler-core/src/test/java/io/ssaownership/reconciler/ExecutorRecoverySchedulerTest.java
+ * FILE 18: reconciler-core/src/test/java/io/ssaownership/reconciler/ExecutorRecoverySchedulerTest.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -2640,7 +2758,7 @@ class ExecutorRecoverySchedulerTest {
 
 
 /* ============================================================================
- * FILE 18: reconciler-core/src/test/java/io/ssaownership/reconciler/InMemoryStore.java
+ * FILE 19: reconciler-core/src/test/java/io/ssaownership/reconciler/InMemoryStore.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -2729,7 +2847,7 @@ final class InMemoryStore implements ConfigMapStore {
 
 
 /* ============================================================================
- * FILE 19: reconciler-core/src/test/java/io/ssaownership/reconciler/ManualScheduler.java
+ * FILE 20: reconciler-core/src/test/java/io/ssaownership/reconciler/ManualScheduler.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -2812,7 +2930,7 @@ final class ManualScheduler implements RecoveryScheduler {
 
 
 /* ============================================================================
- * FILE 20: reconciler-core/src/test/java/io/ssaownership/reconciler/ReconcilerTest.java
+ * FILE 21: reconciler-core/src/test/java/io/ssaownership/reconciler/ReconcilerTest.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -3043,7 +3161,7 @@ class ReconcilerTest {
 
 
 /* ============================================================================
- * FILE 21: reconciler-core/src/test/java/io/ssaownership/reconciler/WatchLifecycleTest.java
+ * FILE 22: reconciler-core/src/test/java/io/ssaownership/reconciler/WatchLifecycleTest.java
  * ============================================================================ */
 
 package io.ssaownership.reconciler;
@@ -3764,7 +3882,7 @@ class WatchLifecycleTest {
 
 
 /* ============================================================================
- * FILE 22: schemasync-operator/src/main/java/io/ssaownership/schemasync/BrokenSchemaSyncReconciler.java
+ * FILE 23: schemasync-operator/src/main/java/io/ssaownership/schemasync/BrokenSchemaSyncReconciler.java
  * ============================================================================ */
 
 package io.ssaownership.schemasync;
@@ -3799,12 +3917,12 @@ public final class BrokenSchemaSyncReconciler {
 
     public BrokenSchemaSyncReconciler(KubernetesClient client, String namespace) {
         this.client = java.util.Objects.requireNonNull(client, "client");
-        this.namespace = java.util.Objects.requireNonNull(namespace, "namespace");
+        this.namespace = Names.require(namespace, "namespace");
     }
 
     /** Reconcile: (wrongly) server-side-apply the spec, co-owning spec.schemaVersion. */
     public void reconcile(String name) {
-        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+        Names.require(name, "name");
         SchemaBinding current = client.resources(SchemaBinding.class)
                 .inNamespace(namespace).withName(name).get();
         if (current == null) return;
@@ -3831,7 +3949,7 @@ public final class BrokenSchemaSyncReconciler {
 
 
 /* ============================================================================
- * FILE 23: schemasync-operator/src/main/java/io/ssaownership/schemasync/FixedSchemaSyncReconciler.java
+ * FILE 24: schemasync-operator/src/main/java/io/ssaownership/schemasync/FixedSchemaSyncReconciler.java
  * ============================================================================ */
 
 package io.ssaownership.schemasync;
@@ -3879,12 +3997,12 @@ public final class FixedSchemaSyncReconciler {
 
     public FixedSchemaSyncReconciler(KubernetesClient client, String namespace) {
         this.client = java.util.Objects.requireNonNull(client, "client");
-        this.namespace = java.util.Objects.requireNonNull(namespace, "namespace");
+        this.namespace = Names.require(namespace, "namespace");
     }
 
     /** Reconcile: write ONLY status.observedSchemaVersion (never spec). */
     public void reconcile(String name) {
-        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+        Names.require(name, "name");
         SchemaBinding current = client.resources(SchemaBinding.class)
                 .inNamespace(namespace).withName(name).get();
         if (current == null) return;
@@ -3913,7 +4031,7 @@ public final class FixedSchemaSyncReconciler {
      * demonstration test asserts the value is preserved precisely because the chart co-owns it.
      */
     public void releaseStaleSpecOwnership(String name) {
-        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+        Names.require(name, "name");
         SchemaBinding emptyApply = new SchemaBinding();
         emptyApply.getMetadata().setName(name);
         // No spec set -> this manager, after this apply, owns no spec fields.
@@ -3930,7 +4048,7 @@ public final class FixedSchemaSyncReconciler {
 
 
 /* ============================================================================
- * FILE 24: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBinding.java
+ * FILE 25: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBinding.java
  * ============================================================================ */
 
 package io.ssaownership.schemasync.model;
@@ -3957,7 +4075,7 @@ public class SchemaBinding extends CustomResource<SchemaBindingSpec, SchemaBindi
 
 
 /* ============================================================================
- * FILE 25: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBindingSpec.java
+ * FILE 26: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBindingSpec.java
  * ============================================================================ */
 
 package io.ssaownership.schemasync.model;
@@ -3971,12 +4089,13 @@ public class SchemaBindingSpec {
 
 
 /* ============================================================================
- * FILE 26: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBindingStatus.java
+ * FILE 27: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBindingStatus.java
  * ============================================================================ */
 
 package io.ssaownership.schemasync.model;
 
-/** Observed state, owned by the operator (written via the /status subresource). */
+/** Observed state, written by the operator through the /status subresource (a normal status
+ *  update, not server-side apply — so "written by", not SSA-"owned by"). */
 public class SchemaBindingStatus {
     private String observedSchemaVersion;
     private String phase;
@@ -3988,7 +4107,27 @@ public class SchemaBindingStatus {
 
 
 /* ============================================================================
- * FILE 27: schemasync-operator/src/test/java/io/ssaownership/schemasync/SchemaSyncOwnershipIT.java
+ * FILE 28: schemasync-operator/src/main/java/io/ssaownership/schemasync/Names.java
+ * ============================================================================ */
+
+package io.ssaownership.schemasync;
+
+/** Small shared validation helpers for operator inputs (avoids repeating null/blank checks). */
+final class Names {
+    private Names() {}
+
+    /** Reject null or blank, returning the value otherwise. */
+    static String require(String value, String what) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(what + " must not be null or blank");
+        }
+        return value;
+    }
+}
+
+
+/* ============================================================================
+ * FILE 29: schemasync-operator/src/test/java/io/ssaownership/schemasync/SchemaSyncOwnershipIT.java
  * ============================================================================ */
 
 package io.ssaownership.schemasync;

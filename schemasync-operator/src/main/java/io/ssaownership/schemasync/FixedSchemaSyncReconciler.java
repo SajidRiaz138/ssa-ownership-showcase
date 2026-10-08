@@ -43,12 +43,12 @@ public final class FixedSchemaSyncReconciler {
 
     public FixedSchemaSyncReconciler(KubernetesClient client, String namespace) {
         this.client = java.util.Objects.requireNonNull(client, "client");
-        this.namespace = java.util.Objects.requireNonNull(namespace, "namespace");
+        this.namespace = Names.require(namespace, "namespace");
     }
 
     /** Reconcile: write ONLY status.observedSchemaVersion (never spec). */
     public void reconcile(String name) {
-        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+        Names.require(name, "name");
         SchemaBinding current = client.resources(SchemaBinding.class)
                 .inNamespace(namespace).withName(name).get();
         if (current == null) return;
@@ -77,7 +77,7 @@ public final class FixedSchemaSyncReconciler {
      * demonstration test asserts the value is preserved precisely because the chart co-owns it.
      */
     public void releaseStaleSpecOwnership(String name) {
-        if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+        Names.require(name, "name");
         SchemaBinding emptyApply = new SchemaBinding();
         emptyApply.getMetadata().setName(name);
         // No spec set -> this manager, after this apply, owns no spec fields.

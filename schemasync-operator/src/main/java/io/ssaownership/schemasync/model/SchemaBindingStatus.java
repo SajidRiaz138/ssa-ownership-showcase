@@ -1,6 +1,7 @@
 package io.ssaownership.schemasync.model;
 
-/** Observed state, owned by the operator (written via the /status subresource). */
+/** Observed state, written by the operator through the /status subresource (a normal status
+ *  update, not server-side apply — so "written by", not SSA-"owned by"). */
 public class SchemaBindingStatus {
     private String observedSchemaVersion;
     private String phase;

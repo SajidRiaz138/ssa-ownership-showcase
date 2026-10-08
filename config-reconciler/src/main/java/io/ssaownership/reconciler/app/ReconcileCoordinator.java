@@ -68,6 +68,7 @@ public final class ReconcileCoordinator implements AutoCloseable {
     private long retryToken = 0;              // identifies the current RETRY_PENDING reservation
     private ScheduledFuture<?> retryHandle;   // the pending retry's handle (guarded)
     private ScheduledFuture<?> resyncHandle;  // periodic resync handle (guarded)
+    private boolean resyncStarting = false;   // resync startup reserved, scheduling outside lock (guarded)
 
     public ReconcileCoordinator(Reconciler reconciler, ScheduledExecutorService executor,
                                 Duration retryDelay, Duration resyncInterval) {
@@ -105,19 +106,42 @@ public final class ReconcileCoordinator implements AutoCloseable {
 
     /** Start periodic resync. Call once after construction. */
     public void startPeriodicResync() {
-        boolean report = false;
-        RejectedExecutionException rejection = null;
+        // Reserve startup under the lock; schedule OUTSIDE the lock (consistent with the rule that
+        // infrastructure calls never happen under the coordinator lock); publish the handle only
+        // if still current.
         lock.lock();
         try {
-            if (state == State.CLOSED || resyncHandle != null) return;
-            resyncHandle = executor.scheduleWithFixedDelay(this::trigger,
-                    resyncIntervalMs, resyncIntervalMs, TimeUnit.MILLISECONDS);
-        } catch (RejectedExecutionException rej) {
-            report = (state != State.CLOSED);
-            rejection = rej;
+            if (state == State.CLOSED || resyncStarting || resyncHandle != null) return;
+            resyncStarting = true;
         } finally {
             lock.unlock();
         }
+
+        ScheduledFuture<?> handle = null;
+        RejectedExecutionException rejection = null;
+        try {
+            handle = executor.scheduleWithFixedDelay(this::trigger,
+                    resyncIntervalMs, resyncIntervalMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException rej) {
+            rejection = rej;
+        }
+
+        ScheduledFuture<?> toCancel = null;
+        boolean report = false;
+        lock.lock();
+        try {
+            resyncStarting = false;
+            if (rejection != null) {
+                report = (state != State.CLOSED);
+            } else if (state == State.CLOSED) {
+                toCancel = handle;        // closed while scheduling -> drop the late handle
+            } else {
+                resyncHandle = handle;    // publish
+            }
+        } finally {
+            lock.unlock();
+        }
+        cancelOutsideLock(toCancel);
         if (report) reportUnexpectedRejection(rejection);
     }
 
