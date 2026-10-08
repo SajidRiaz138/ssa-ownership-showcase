@@ -55,10 +55,12 @@ Maven wrapper is committed.
 ```
 
 ## Architecture & decisions
-- `docs/ARCHITECTURE.md` — components and the ownership model.
+- `docs/ARCHITECTURE.md` — components, the ownership model, runtime data flow, lifecycle & shutdown.
+- `docs/SCENARIOS.md` — every scenario the system handles, mapped to its verifying test + evidence class.
 - `docs/adr/ADR-0001` reconciliation contract · `ADR-0002` lifecycle & recovery ·
-  `ADR-0003` fabric8 adapter · `ADR-0004` operator field ownership.
-- `docs/mutation-evidence.md` — the executed old-fails/new-passes runs for the two DEMO regressions.
+  `ADR-0003` fabric8 adapter · `ADR-0004` operator field ownership · `ADR-0005` runtime coordination.
+- `docs/verification-record.md` — corrected source / reviewed coverage / executed verification.
+- `docs/mutation-evidence.md` — the executed old-fails/new-passes runs for the three DEMO regressions.
 
 ## The runnable demo
 ```
