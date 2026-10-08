@@ -58,8 +58,35 @@ BUILD FAILURE
 ```
 **Restored — PASSES:** `Tests run: 1, Failures: 0 … BUILD SUCCESS`.
 
+## 3. Coordinator close-guard (ReconcileCoordinator)
+
+**Bug injected:** `runRetry` drops its token/closed guard, so a stale/dequeued retry proceeds to
+`drain()` even after `close()`.
+
+```
+-   if (state != State.RETRY_PENDING || retryToken != token) return;  // superseded/closed
+-   state = State.RUNNING;
++   state = State.RUNNING;
+```
+
+**Command:**
+```
+./mvnw -pl config-reconciler -am test \
+  -Dtest='ReconcileCoordinatorTest#close_cancels_a_pending_retry_and_prevents_post_close_reconcile' \
+  -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+**Result — MUTANT FAILS:**
+```
+close_cancels_a_pending_retry_and_prevents_post_close_reconcile:134
+  no reconcile pass may run after close ... ==> expected: <1> but was: <2>
+Tests run: 1, Failures: 1 ... BUILD FAILURE
+```
+**Restored — PASSES.** This proves the close/retry correctness comes from the token/closed check,
+not from cancellation.
+
 ## Scope note
 
-These two are the only claims in the ADRs marked **DEMO** (demonstrated regression). All other
+These three are the only claims in the ADRs marked **DEMO** (demonstrated regression). All other
 lifecycle/scheduler/reconciler tests are **BEHAV** (they pin current behaviour under deterministic
 conditions) or **STRUCT** (source review). See ADR-0002 for the full invariant→test→evidence map.
