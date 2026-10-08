@@ -127,7 +127,8 @@ public final class Reconciler {
             return Outcome.WROTE;
         }
         // false is a successful policy decision: a value already exists and we preserve it.
-        LOG.info("[{}] {}.{} already present; left untouched", name, targetConfigMap, key);
+        // DEBUG, not INFO: this is the steady-state outcome of a frequently-running reconcile.
+        LOG.debug("[{}] {}.{} already present; left untouched", name, targetConfigMap, key);
         return Outcome.SKIPPED_PRESENT;
     }
 }

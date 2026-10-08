@@ -11,7 +11,8 @@ import java.util.Optional;
  * empty) so a test cannot pass against behaviour the real adapter would not reproduce.
  *
  * NOT thread-safe and NOT evidence of concurrent putIfAbsent correctness — the deterministic
- * conditional-update race is proven against a real API server, not here.
+ * conditional-update race must be verified against a real API server (KubeConfigMapStoreIT), not
+ * here. This fake only honours the single-threaded policy parts of the contract.
  */
 final class InMemoryStore implements ConfigMapStore {
 

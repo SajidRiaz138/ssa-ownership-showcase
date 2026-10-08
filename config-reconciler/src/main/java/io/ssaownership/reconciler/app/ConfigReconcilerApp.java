@@ -78,9 +78,18 @@ public final class ConfigReconcilerApp implements AutoCloseable {
         return desired != null ? desired : "derived-default";
     }
 
-    /** Create a watch on the source ConfigMap; each event triggers a reconcile on the worker. */
+    /**
+     * Create a watch on the source ConfigMap; each event triggers a reconcile on the worker.
+     *
+     * <p>A reconcile is ALSO scheduled every time this factory runs — i.e. on initial registration
+     * AND on each recovery after a watch closed. Restarting a watch does not replay events missed
+     * while it was disconnected, so without this a change to the source during the gap could be
+     * lost until the next source event. Re-deriving on (re)install closes that gap for the derived
+     * value: the reconcile re-reads the source and enforces the observed destination. (It is a
+     * level-based resync of THIS app's single derived field, not a general event-replay.)
+     */
     private Watch watchSource(Runnable onClosed) {
-        return client.configMaps().inNamespace(namespace).withName(sourceConfigMap)
+        Watch w = client.configMaps().inNamespace(namespace).withName(sourceConfigMap)
                 .watch(new Watcher<>() {
                     @Override public void eventReceived(Action action, ConfigMap resource) {
                         LOG.info("source event {}; scheduling reconcile", action);
@@ -91,6 +100,9 @@ public final class ConfigReconcilerApp implements AutoCloseable {
                         onClosed.run();     // hand back to the lifecycle (recovery)
                     }
                 });
+        // reconcile-on-(re)install: resync the derived field for anything missed while disconnected
+        worker.submit(this::reconcileSafely);
+        return w;
     }
 
     private void reconcileSafely() {
@@ -102,11 +114,10 @@ public final class ConfigReconcilerApp implements AutoCloseable {
         }
     }
 
-    /** Start: install the watch and do an initial reconcile (startup seeding/enforcement). */
+    /** Start: install the watch (which also triggers the initial reconcile on install). */
     public void start() {
         LOG.info("starting; source={} target={}.{}", sourceConfigMap, targetConfigMap, key);
-        lifecycle.registerWatch();
-        worker.submit(this::reconcileSafely);   // initial pass
+        lifecycle.registerWatch();          // installs the watch; watchSource() schedules the initial reconcile
     }
 
     @Override

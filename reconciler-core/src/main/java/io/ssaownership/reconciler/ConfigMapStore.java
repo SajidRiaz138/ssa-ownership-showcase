@@ -47,8 +47,10 @@ public interface ConfigMapStore {
     }
 
     /**
-     * @return the current value of {@code key} in {@code configMap}; empty ONLY if the key is
-     *         absent. Throws {@link StoreException} on API failure (never maps error to empty).
+     * @return the current value of {@code key} in {@code configMap}; empty if the ConfigMap does
+     *         not exist OR the key is absent (these two "absent" cases are not distinguished).
+     *         A present empty-string value returns {@code Optional.of("")}. Throws
+     *         {@link StoreException} on API failure (never maps error to empty).
      */
     Optional<String> get(String configMap, String key);
 

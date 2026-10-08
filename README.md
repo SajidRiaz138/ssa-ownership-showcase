@@ -58,6 +58,7 @@ Maven wrapper is committed.
 - `docs/ARCHITECTURE.md` — components and the ownership model.
 - `docs/adr/ADR-0001` reconciliation contract · `ADR-0002` lifecycle & recovery ·
   `ADR-0003` fabric8 adapter · `ADR-0004` operator field ownership.
+- `docs/mutation-evidence.md` — the executed old-fails/new-passes runs for the two DEMO regressions.
 
 ## The runnable demo
 ```

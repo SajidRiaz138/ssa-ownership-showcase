@@ -104,6 +104,53 @@ class ReconcilerTest {
         assertEquals("d", s.get(CM, KEY).orElseThrow());
     }
 
+    /**
+     * A store that COMMITS the write and THEN throws — modelling the "unknown remote outcome"
+     * case where the server applied the change but the client saw a failure (timeout after
+     * commit). The first pass must report FAILED (the client cannot claim success); the next
+     * pass, observing the now-committed destination, must settle to a benign skip rather than
+     * re-writing or looping. This is exactly the semantics the Reconciler javadoc claims.
+     */
+    private static final class CommitThenThrowStore implements ConfigMapStore {
+        private final InMemoryStore delegate;
+        boolean armed;                      // throw once, after committing
+        CommitThenThrowStore(InMemoryStore delegate, boolean armed) { this.delegate = delegate; this.armed = armed; }
+        @Override public Optional<String> get(String cm, String k) { return delegate.get(cm, k); }
+        @Override public void upsert(String cm, String k, String v) {
+            delegate.upsert(cm, k, v);                       // COMMIT
+            if (armed) { armed = false; throw new StoreException("committed, then connection dropped"); }
+        }
+        @Override public boolean putIfAbsent(String cm, String k, String v) {
+            boolean wrote = delegate.putIfAbsent(cm, k, v);  // COMMIT
+            if (armed) { armed = false; throw new StoreException("committed insert, then connection dropped"); }
+            return wrote;
+        }
+    }
+
+    @Test
+    void upsert_commit_then_throw_is_FAILED_then_next_pass_is_SKIPPED_IN_SYNC() {
+        InMemoryStore backing = new InMemoryStore(); backing.createConfigMap(CM);
+        CommitThenThrowStore s = new CommitThenThrowStore(backing, true);
+        Reconciler r = new Reconciler("enforce", CM, KEY, WriteStrategy.UPSERT, s, () -> "A");
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile(),
+                "a write that committed but then threw must be reported FAILED (unknown remote outcome)");
+        assertEquals("A", backing.get(CM, KEY).orElseThrow(), "the write did commit remotely");
+        assertEquals(Reconciler.Outcome.SKIPPED_IN_SYNC, r.reconcile(),
+                "the next pass observes the committed value and settles — no re-write, no loop");
+    }
+
+    @Test
+    void putIfAbsent_commit_then_throw_is_FAILED_then_next_pass_is_SKIPPED_PRESENT() {
+        InMemoryStore backing = new InMemoryStore(); backing.createConfigMap(CM);
+        CommitThenThrowStore s = new CommitThenThrowStore(backing, true);
+        Reconciler r = new Reconciler("seed", CM, KEY, WriteStrategy.PUT_IF_ABSENT, s, () -> "d");
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile(),
+                "a committed insert that then threw must be reported FAILED");
+        assertEquals("d", backing.get(CM, KEY).orElseThrow(), "the insert did commit remotely");
+        assertEquals(Reconciler.Outcome.SKIPPED_PRESENT, r.reconcile(),
+                "the next pass sees the key present and preserves it — no duplicate write");
+    }
+
     @Test
     void empty_string_value_counts_as_present_and_in_sync() {
         InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);

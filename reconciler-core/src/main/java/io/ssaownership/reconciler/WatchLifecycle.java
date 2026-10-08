@@ -120,9 +120,26 @@ public final class WatchLifecycle {
         if (baseDelay.isNegative() || baseDelay.isZero()) throw new IllegalArgumentException("baseDelay must be positive");
         if (stableResetAfter.isNegative() || stableResetAfter.isZero()) throw new IllegalArgumentException("stableResetAfter must be positive");
         if (maxDelay.compareTo(baseDelay) < 0) throw new IllegalArgumentException("maxDelay must be >= baseDelay");
-        this.baseDelayMs = Math.max(1, baseDelay.toMillis());
-        this.maxDelayMs = Math.max(this.baseDelayMs, maxDelay.toMillis());
-        this.stableResetAfterNanos = stableResetAfter.toNanos();
+        // Representable ranges: baseDelay/maxDelay must fit in milliseconds and stableResetAfter in
+        // nanoseconds (Duration conversion throws ArithmeticException on overflow). Normalise that
+        // overflow into a configuration error that names the offending parameter, rather than
+        // letting a raw ArithmeticException escape the constructor.
+        this.baseDelayMs = Math.max(1, toMillisOrReject(baseDelay, "baseDelay"));
+        this.maxDelayMs = Math.max(this.baseDelayMs, toMillisOrReject(maxDelay, "maxDelay"));
+        this.stableResetAfterNanos = toNanosOrReject(stableResetAfter, "stableResetAfter");
+    }
+
+    private static long toMillisOrReject(Duration d, String param) {
+        try { return d.toMillis(); }
+        catch (ArithmeticException overflow) {
+            throw new IllegalArgumentException(param + " too large to represent in milliseconds: " + d, overflow);
+        }
+    }
+    private static long toNanosOrReject(Duration d, String param) {
+        try { return d.toNanos(); }
+        catch (ArithmeticException overflow) {
+            throw new IllegalArgumentException(param + " too large to represent in nanoseconds: " + d, overflow);
+        }
     }
 
     /** Explicit (re)registration. Invalidates any pending recovery and authorizes a replacement. */
@@ -164,11 +181,17 @@ public final class WatchLifecycle {
         Watch toClose = null;
         lock.lock();
         try {
-            // Close-before-install is enforced here WITHOUT a flag on Attempt: if the candidate
-            // closed during/just after creation, its bound onClosed(attempt.generation) already
-            // ran and advanced `generation` (reserving recovery). So a closed candidate's attempt
-            // is no longer the current generation, and this check rejects it. A live candidate's
-            // generation is still current and installs.
+            // Close-before-install is enforced here WITHOUT a flag on Attempt, but the guarantee
+            // depends on WHEN the close is OBSERVED (the bound onClosed acquiring this lock), not
+            // on when the watch physically terminated:
+            //   - If this attempt's close notification was PROCESSED BEFORE this installation check,
+            //     its onClosed(attempt.generation) already advanced `generation` (reserving
+            //     recovery), so attempt.generation != generation and the candidate is rejected here.
+            //   - If closure is processed AFTER installation, the candidate is briefly installed and
+            //     onClosed then detaches it and arranges recovery (the normal installed-close path).
+            // A real client may physically terminate a watch before its callback runs; that latter
+            // ordering is handled, not prevented. This is a probe-free distinction between physical
+            // termination and lifecycle-observed termination.
             if (health == Health.DEACTIVATED || attempt.generation != generation) {
                 // Invariant 2 & 6: superseded, shut down, or self-closed. Reject this candidate.
                 LOG.info("[{}] candidate gen {} rejected (health={}, current={})",

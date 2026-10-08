@@ -213,13 +213,23 @@ class WatchLifecycleTest {
     @Test @Timeout(10)
     void during_creation_supersession_rejects_and_cleans_up_the_stale_candidate() {
         // Supersession that happens WHILE recovery is INSIDE the factory (not the pre-creation
-        // gap — see authorization_gap_* for that). Single-threaded via a factory seam.
+        // gap — see authorization_gap_* for that). Single-threaded via a factory seam. The
+        // explicit replacement B is registered re-entrantly from inside the recovery's create()
+        // call; the stale recovery candidate must be rejected on its install attempt. We capture
+        // B's identity at the moment of its registration so the assertions prove the EXPLICIT
+        // winner stayed installed — not merely that "some one watch" is installed (a stale
+        // recovery winning and closing B would satisfy a bare count).
         ManualScheduler s = new ManualScheduler();
         final WatchLifecycle[] ref = new WatchLifecycle[1];
         final boolean[] arm = {false};
+        final TestWatch[] winnerBox = new TestWatch[1];
         Factory raceFactory = new Factory() {
             @Override public Watch create(Runnable onClosed) {
-                if (arm[0]) { arm[0] = false; ref[0].registerWatch(); }  // install newer during create
+                if (arm[0]) {
+                    arm[0] = false;
+                    ref[0].registerWatch();                 // install newer B during recovery's create
+                    winnerBox[0] = installedWatch(this, ref[0]);   // capture the explicit winner B
+                }
                 return super.create(onClosed);
             }
         };
@@ -228,11 +238,14 @@ class WatchLifecycleTest {
         lc.registerWatch();
         installedWatch(raceFactory, lc).close();
         ManualScheduler.Task recovery = s.last();
-        TestWatch[] winnerBox = new TestWatch[1];
         arm[0] = true;
         s.runEvenIfCancelled(recovery);
+        assertNotNull(winnerBox[0], "the explicit replacement must have been captured");
+        assertTrue(lc.debugIsInstalled(winnerBox[0]),
+                "the EXPLICIT replacement B must remain installed; the stale recovery candidate must not displace it");
         assertEquals(1, raceFactory.created.stream().filter(lc::debugIsInstalled).count(),
-                "exactly one installed (the newer winner)");
+                "exactly one installed (the explicit winner)");
+        assertFalse(lc.debugHasPendingRecovery(), "no competing recovery left pending");
         assertNoLeak(raceFactory, lc);
     }
 
@@ -264,12 +277,19 @@ class WatchLifecycleTest {
         Future<?> recFut = pool.submit(() -> { s.runEvenIfCancelled(recovery); return null; });
         try {
             assertTrue(atSeam.await(2, TimeUnit.SECONDS), "recovery must reach the seam (authorized, pre-create)");
+            // At the seam the reservation has been CONSUMED (authorized into an Attempt): recovery
+            // no longer holds a pending reservation that an explicit registration would need to
+            // cancel. This is precisely why the identity must be carried, not re-minted.
+            assertFalse(lc.debugHasPendingRecovery(),
+                    "authorization must have consumed the reservation before the seam");
             lc.registerWatch();                               // explicit B while R is paused pre-create
             TestWatch b = installedWatch(f, lc);
             release.countDown();                              // let R proceed to create+install-attempt
             recFut.get(5, TimeUnit.SECONDS);                  // propagate worker exceptions; await completion
             assertTrue(lc.debugIsInstalled(b), "explicit B must remain installed; stale R cannot displace it");
             assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count());
+            assertFalse(lc.debugHasPendingRecovery(),
+                    "the stale recovery must not leave a competing recovery scheduled");
             assertNoLeak(f, lc);
         } finally {
             release.countDown();
@@ -332,6 +352,298 @@ class WatchLifecycleTest {
         assertEquals(WatchLifecycle.Health.DEGRADED, lc.health(),
                 "rejected recovery scheduling must surface DEGRADED");
         assertFalse(lc.debugHasPendingRecovery(), "no phantom pending recovery after rejection");
+    }
+
+    // ---- scheduler handle-publication & shutdown/supersession orderings ---------------------
+    //
+    // These exercise the races the lifecycle documentation explicitly claims: the handle returned
+    // by schedule() can arrive AFTER the task it schedules has already run (or after the lifecycle
+    // was superseded/shut down), and a scheduling REJECTION can arrive after supersession/shutdown.
+    // A controllable scheduler lets the test fix the ordering. Crucially, tasks run on a REAL
+    // separate thread (never inline inside schedule()), so the harness does not itself violate the
+    // "never inline" scheduler contract while verifying it.
+
+    /**
+     * Controllable {@link RecoveryScheduler}: captures each scheduled task; the test runs it (on a
+     * dedicated thread) and independently decides when schedule() returns its handle, so handle
+     * publication can be ordered before/after task execution, supersession, or shutdown. Bookkeeping
+     * is synchronized; task bodies are NEVER invoked while holding the lock.
+     */
+    static final class ControllableScheduler implements RecoveryScheduler {
+        static final class Handle implements Cancellable {
+            final AtomicInteger cancels = new AtomicInteger();
+            @Override public void cancel() { cancels.incrementAndGet(); }
+            boolean cancelled() { return cancels.get() > 0; }
+        }
+        final Object mon = new Object();
+        Runnable lastTask;                       // guarded by mon
+        Handle lastHandle;                       // guarded by mon
+        volatile boolean rejectNext = false;
+        private CountDownLatch releaseSchedule;  // if set, schedule() blocks until counted down
+        private boolean rejectOnRelease = false; // if set, the released schedule() throws instead of returning
+
+        /** Arrange that the NEXT schedule() call blocks (after capturing the task) until released. */
+        CountDownLatch blockNextScheduleReturn() {
+            CountDownLatch l = new CountDownLatch(1);
+            synchronized (mon) { releaseSchedule = l; rejectOnRelease = false; }
+            return l;
+        }
+        /** Like {@link #blockNextScheduleReturn} but the released schedule() THROWS a rejection. */
+        CountDownLatch blockThenRejectNextSchedule() {
+            CountDownLatch l = new CountDownLatch(1);
+            synchronized (mon) { releaseSchedule = l; rejectOnRelease = true; }
+            return l;
+        }
+
+        @Override public Cancellable schedule(Duration delay, Runnable task) {
+            if (rejectNext) { rejectNext = false; throw new ManualScheduler.RejectedException("rejected"); }
+            CountDownLatch toAwait;
+            boolean reject;
+            Handle h = new Handle();
+            synchronized (mon) {
+                lastTask = task; lastHandle = h;
+                toAwait = releaseSchedule; releaseSchedule = null;
+                reject = rejectOnRelease; rejectOnRelease = false;
+            }
+            if (toAwait != null) {
+                try { if (!toAwait.await(2, TimeUnit.SECONDS)) throw new AssertionError("schedule() not released"); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+            }
+            if (reject) throw new ManualScheduler.RejectedException("rejected on release");
+            return h;
+        }
+        Runnable task()  { synchronized (mon) { return lastTask; } }
+        Handle handle()  { synchronized (mon) { return lastHandle; } }
+    }
+
+    private Future<?> runOnThread(ExecutorService pool, Runnable r) {
+        return pool.submit(() -> { r.run(); return null; });
+    }
+
+    @Test @Timeout(10)
+    void recovery_runs_before_schedule_returns_its_handle_then_handle_is_cancelled() throws Exception {
+        // Ordering: schedule() captures the task but BLOCKS before returning its handle. The task
+        // runs to completion on another thread (consuming the reservation, installing B). Only then
+        // does schedule() return. The lifecycle must observe the reservation is no longer pending
+        // and CANCEL the late handle rather than record it.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
+            lc.registerWatch();                              // A
+            // closing A calls scheduleRecovery, which will block inside schedule():
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            // wait until the task was captured (schedule() entered):
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
+            assertNotNull(s.task(), "recovery task must have been handed to the scheduler");
+            // run the recovery task NOW, before schedule() has returned its handle:
+            Future<?> runFut = runOnThread(pool, s.task());
+            runFut.get(5, TimeUnit.SECONDS);                 // recovery installs B, consumes reservation
+            releaseSchedule.countDown();                     // now let schedule() return the late handle
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertTrue(s.handle().cancelled(),
+                    "a handle returned after its task already ran must be cancelled, not recorded");
+            assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count(), "B installed");
+            assertFalse(lc.debugHasPendingRecovery());
+            assertNoLeak(f, lc);
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void handle_returned_after_supersession_is_cancelled_and_newer_work_unaffected() throws Exception {
+        // schedule() blocks before returning. While blocked, an explicit registration supersedes
+        // the recovery reservation and installs B. When schedule() finally returns, the stale
+        // handle must be cancelled and B must be untouched.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
+            lc.registerWatch();                              // A
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
+            assertNotNull(s.task());
+            lc.registerWatch();                              // explicit B supersedes the reservation
+            TestWatch b = installedWatch(f, lc);
+            releaseSchedule.countDown();                     // schedule() returns the now-stale handle
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertTrue(s.handle().cancelled(), "handle for a superseded reservation must be cancelled");
+            assertTrue(lc.debugIsInstalled(b), "the newer explicit B is unaffected");
+            assertFalse(lc.debugHasPendingRecovery());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void handle_returned_after_shutdown_is_cancelled_and_no_reactivation() throws Exception {
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
+            lc.registerWatch();
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
+            assertNotNull(s.task());
+            lc.deactivate();                                 // shutdown while schedule() is blocked
+            releaseSchedule.countDown();
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertTrue(s.handle().cancelled(), "late handle after shutdown must be cancelled");
+            assertEquals(WatchLifecycle.Health.DEACTIVATED, lc.health(), "shutdown stays terminal");
+            assertFalse(lc.debugHasPendingRecovery(), "no reactivation");
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void scheduling_rejected_after_supersession_does_not_mark_newer_work_degraded() throws Exception {
+        // The recovery's scheduleRecovery() REJECTS, but by the time the rejection surfaces an
+        // explicit B has already superseded the reservation. The rejection must NOT drag the
+        // (healthy) newer state into DEGRADED, because the rejected reservation is no longer the
+        // pending one.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockThenRejectNextSchedule();  // schedule() will throw on release
+            lc.registerWatch();                              // A
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
+            assertNotNull(s.task(), "recovery was handed to the scheduler (blocked pre-return)");
+            lc.registerWatch();                              // explicit B supersedes reservation R
+            TestWatch b = installedWatch(f, lc);
+            releaseSchedule.countDown();                     // schedule() now throws the rejection
+            closeFut.get(5, TimeUnit.SECONDS);               // onClosed's scheduleRecovery sees the throw
+            assertTrue(lc.debugIsInstalled(b), "newer explicit B stays installed");
+            assertNotEquals(WatchLifecycle.Health.DEGRADED, lc.health(),
+                    "a rejection for a superseded reservation must not degrade newer work");
+            assertFalse(lc.debugHasPendingRecovery());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void scheduling_rejected_after_shutdown_keeps_health_deactivated() throws Exception {
+        // scheduleRecovery() rejects AFTER the lifecycle was deactivated: the health==DEACTIVATED
+        // guard must keep it terminal, never flipping to DEGRADED.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockThenRejectNextSchedule();
+            lc.registerWatch();
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
+            assertNotNull(s.task());
+            lc.deactivate();                                 // terminal, while schedule() is blocked
+            releaseSchedule.countDown();                     // schedule() throws the rejection now
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertEquals(WatchLifecycle.Health.DEACTIVATED, lc.health(),
+                    "a rejection after shutdown must leave health DEACTIVATED, not DEGRADED");
+            assertFalse(lc.debugHasPendingRecovery());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void shutdown_while_factory_creation_blocked_closes_the_late_candidate_and_never_installs() throws Exception {
+        // registerWatch()'s create() blocks inside the factory. While blocked, the lifecycle is
+        // deactivated. When create() returns, the candidate must be CLOSED (cleaned up) and never
+        // installed — shutdown prevents installation but not the already-dispatched factory call.
+        CountDownLatch inFactory = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Factory f = new Factory() {
+            @Override public Watch create(Runnable onClosed) {
+                inFactory.countDown();
+                try { if (!release.await(2, TimeUnit.SECONDS)) throw new AssertionError("not released"); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+                return super.create(onClosed);
+            }
+        };
+        ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> regFut = runOnThread(pool, lc::registerWatch);
+            assertTrue(inFactory.await(2, TimeUnit.SECONDS), "create must be blocked in the factory");
+            lc.deactivate();                                 // shutdown while candidate is being created
+            release.countDown();
+            regFut.get(5, TimeUnit.SECONDS);
+            assertEquals(0, f.created.stream().filter(lc::debugIsInstalled).count(), "late candidate never installed");
+            TestWatch candidate = f.created.iterator().next();
+            assertTrue(candidate.closed(), "the late candidate must be closed (cleaned up)");
+            assertEquals(WatchLifecycle.Health.DEACTIVATED, lc.health());
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void replacement_creation_fails_while_old_healthy_keeps_old_installed_and_follows_recovery_policy() throws Exception {
+        // A installed and healthy. An explicit re-registration B's create() THROWS (before any
+        // install). A create failure must NOT tear down the healthy A — supersession happens only
+        // on a SUCCESSFUL create — and onCreateFailed must schedule recovery for the current
+        // (failed) attempt. The subsequent recovery create succeeds and supersedes A.
+        AtomicInteger entries = new AtomicInteger();
+        Factory f = new Factory() {
+            @Override public Watch create(Runnable onClosed) {
+                if (entries.incrementAndGet() == 2) {        // entry 1 = A, entry 2 = B (fails), entry 3 = recovery
+                    throw new IllegalStateException("boom on B's create");
+                }
+                return super.create(onClosed);
+            }
+        };
+        ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();                                  // A (entry 1 ok)
+        TestWatch a = installedWatch(f, lc);
+        lc.registerWatch();                                  // B: entry 2 throws
+        assertFalse(a.closed(), "a failed replacement create must not close the healthy old watch");
+        assertTrue(lc.debugIsInstalled(a), "A remains installed after B's create failure");
+        assertTrue(lc.debugHasPendingRecovery(), "a failed create schedules recovery (policy)");
+        s.runLast();                                         // entry 3: recovery create succeeds
+        assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count(), "exactly one installed");
+        assertFalse(lc.debugIsInstalled(a), "recovery's new watch supersedes A");
+        assertTrue(a.closed(), "A is closed when the successful replacement installs");
+    }
+
+    @Test @Timeout(10)
+    void constructor_normalizes_duration_overflow_into_a_named_config_error() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        Duration overflowMillis = Duration.ofSeconds(Long.MAX_VALUE);   // toMillis() overflows
+        // baseDelay overflow:
+        IllegalArgumentException b = assertThrows(IllegalArgumentException.class,
+                () -> new WatchLifecycle("t", f, s, overflowMillis, overflowMillis, Duration.ofSeconds(10), System::nanoTime));
+        assertTrue(b.getMessage().contains("baseDelay"), "must name baseDelay: " + b.getMessage());
+        // stableResetAfter overflow (nanos): valid base/max, overflowing stability window.
+        Duration overflowNanos = Duration.ofSeconds(Long.MAX_VALUE / 1_000_000_000L + 1);
+        IllegalArgumentException st = assertThrows(IllegalArgumentException.class,
+                () -> new WatchLifecycle("t", f, s, Duration.ofSeconds(1), Duration.ofSeconds(30), overflowNanos, System::nanoTime));
+        assertTrue(st.getMessage().contains("stableResetAfter"), "must name stableResetAfter: " + st.getMessage());
     }
 
     // ---- concurrency ------------------------------------------------------------------------

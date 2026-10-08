@@ -58,8 +58,11 @@ public final class ExecutorRecoveryScheduler implements RecoveryScheduler, AutoC
         if (delay.isNegative()) {
             throw new IllegalArgumentException("delay must not be negative: " + delay);
         }
-        // Supported range/precision: milliseconds, 0 .. ~292 years (Long.MAX_VALUE ms).
-        // A positive sub-millisecond delay becomes 1ms (never silently 0). Overflow is rejected.
+        // Accepts nonnegative durations whose toMillis() conversion fits in a long. A positive
+        // sub-millisecond duration is submitted as 1ms (never silently 0). For durations above 1ms
+        // the conversion truncates fractional milliseconds — it does NOT round every positive
+        // duration upward. Actual scheduling precision and extreme-delay handling depend on the
+        // backing executor; conversion overflow is rejected as IllegalArgumentException.
         long millis;
         try {
             millis = delay.toMillis();

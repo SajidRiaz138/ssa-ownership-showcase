@@ -43,14 +43,21 @@ class ExecutorRecoverySchedulerIT {
         // delay) AFTER the target; release the worker; await the marker and assert the target
         // never ran. With cancel() a no-op the target would run before the marker -> test fails.
         ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor();
+        CountDownLatch workerBusy = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        CountDownLatch blockerDone = new CountDownLatch(1);
+        java.util.concurrent.Future<?> blocker = null;
         try {
             ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(exec);
-            CountDownLatch workerBusy = new CountDownLatch(1);
-            CountDownLatch releaseWorker = new CountDownLatch(1);
-            // block the single worker
-            exec.submit(() -> {
-                workerBusy.countDown();
-                releaseWorker.await();
+            // block the single worker; retain its Future so we can observe completion and surface
+            // any failure, and ALWAYS release it in the finally block.
+            blocker = exec.submit(() -> {
+                try {
+                    workerBusy.countDown();
+                    if (!releaseWorker.await(5, TimeUnit.SECONDS)) throw new AssertionError("worker not released");
+                } finally {
+                    blockerDone.countDown();
+                }
                 return null;
             });
             assertTrue(workerBusy.await(5, TimeUnit.SECONDS), "worker should be occupied");
@@ -64,8 +71,12 @@ class ExecutorRecoverySchedulerIT {
             releaseWorker.countDown();                     // now the queue drains in order
             assertTrue(markerRan.await(5, TimeUnit.SECONDS), "marker must run");
             assertEquals(0, targetRuns.get(), "cancelled target must NOT have run");
+            assertTrue(blockerDone.await(5, TimeUnit.SECONDS), "the blocking task must complete");
+            blocker.get(5, TimeUnit.SECONDS);              // surface any failure from the blocking task
         } finally {
+            releaseWorker.countDown();                     // ensure the worker is never left parked
             exec.shutdownNow();
+            assertTrue(exec.awaitTermination(5, TimeUnit.SECONDS), "executor must terminate");
         }
     }
 
