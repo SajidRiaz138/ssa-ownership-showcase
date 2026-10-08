@@ -1,0 +1,6 @@
+apiVersion: v2
+name: config-reconciler
+description: "v3: v2 app-owned ConfigMap PLUS a SchemaBinding CR whose spec the chart owns and the fixed operator records observed state in status"
+type: application
+version: 3.0.0
+appVersion: "1.0"

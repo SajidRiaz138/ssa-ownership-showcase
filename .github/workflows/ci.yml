@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  unit:
+    name: Build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # Unit tests only (surefire). Integration tests (*IT) need a cluster and run in the ssa job.
+      - name: Build + unit test
+        run: ./mvnw -B -DskipITs=true test
+
+  integration:
+    name: Integration (kind) — adapter, app, SSA ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ssa-ci
+      - name: Verify cluster
+        run: kubectl get nodes
+      # failsafe ITs are @EnabledIf(clusterAvailable); kind provides the cluster via default kubeconfig.
+      - name: Build + integration tests (unit + *IT)
+        run: ./mvnw -B verify
+      - name: Upload surefire/failsafe reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: '**/target/*-reports/*.txt'
+
+  helm:
+    name: Helm chart lint + SSA invariant
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.4
+      - name: Lint charts
+        run: |
+          for c in charts/config-reconciler-*; do helm lint "$c"; done
+      - name: Assert v1 writes the owned key and v2 does not
+        run: |
+          v1=$(helm template r charts/config-reconciler-v1-two-writers | awk '/name: demo-config/,/^---/' | grep -c 'message:')
+          v2=$(helm template r charts/config-reconciler-v2-app-owned   | awk '/name: demo-config/,/^---/' | grep -c 'message:')
+          echo "v1=$v1 v2=$v2"
+          test "$v1" = "1" && test "$v2" = "0"

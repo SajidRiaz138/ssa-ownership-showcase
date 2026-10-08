@@ -1,0 +1,37 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: schemabindings.ssaownership.io
+spec:
+  group: ssaownership.io
+  scope: Namespaced
+  names:
+    plural: schemabindings
+    singular: schemabinding
+    kind: SchemaBinding
+    shortNames: [sb]
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}            # the /status subresource — the operator's correct home for observed state
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                # DESIRED state, owned by the deployment/chart:
+                schemaVersion:
+                  type: string
+                # (broken operator wrongly also writes this field; fixed operator never does)
+            status:
+              type: object
+              properties:
+                # OBSERVED state, owned by the operator:
+                observedSchemaVersion:
+                  type: string
+                phase:
+                  type: string

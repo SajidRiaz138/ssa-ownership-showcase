@@ -1,0 +1,14 @@
+image:
+  repository: config-reconciler
+  tag: local
+  pullPolicy: IfNotPresent
+
+namespace: ""
+sourceConfigMap: demo-source
+targetConfigMap: demo-config
+ownedKey: message
+
+# v2 fix: the chart renders the target ConfigMap OBJECT but does NOT write the owned key.
+# The application is the single writer. (chartMessage left unused for an obvious diff from v1.)
+chartWritesMessage: false
+chartMessage: "unused in v2"

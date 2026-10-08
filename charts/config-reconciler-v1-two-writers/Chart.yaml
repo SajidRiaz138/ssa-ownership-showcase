@@ -1,0 +1,6 @@
+apiVersion: v2
+name: config-reconciler
+description: "v1 (BROKEN): chart AND app write demo-config.data.message -> SSA two-writer conflict"
+type: application
+version: 1.0.0
+appVersion: "1.0"

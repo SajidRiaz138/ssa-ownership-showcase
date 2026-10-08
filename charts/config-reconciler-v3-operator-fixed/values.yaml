@@ -1,0 +1,17 @@
+image:
+  repository: config-reconciler
+  tag: local
+  pullPolicy: IfNotPresent
+
+namespace: ""
+sourceConfigMap: demo-source
+targetConfigMap: demo-config
+ownedKey: message
+chartWritesMessage: false
+chartMessage: "unused in v3"
+
+# v3 adds a SchemaBinding whose spec.schemaVersion the CHART owns. The fixed operator records
+# observed state in .status only, so there is no SSA ownership contention.
+schemaBinding:
+  name: demo-binding
+  schemaVersion: "1.0"

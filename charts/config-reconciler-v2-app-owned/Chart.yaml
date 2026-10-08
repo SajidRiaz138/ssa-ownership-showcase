@@ -1,0 +1,6 @@
+apiVersion: v2
+name: config-reconciler
+description: "v2 (FIXED): chart renders the target ConfigMap object but NOT its data -> single writer (the app)"
+type: application
+version: 2.0.0
+appVersion: "1.0"

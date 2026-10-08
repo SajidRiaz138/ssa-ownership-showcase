@@ -1,0 +1,13 @@
+image:
+  repository: config-reconciler
+  tag: local
+  pullPolicy: IfNotPresent
+
+namespace: ""   # defaults to release namespace
+sourceConfigMap: demo-source
+targetConfigMap: demo-config
+ownedKey: message
+
+# v1 anti-pattern: the chart ALSO writes the key the application owns.
+chartWritesMessage: true
+chartMessage: "written-by-chart (v1 two writers)"

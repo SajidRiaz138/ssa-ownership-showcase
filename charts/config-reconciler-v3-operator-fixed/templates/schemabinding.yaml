@@ -1,0 +1,9 @@
+apiVersion: ssaownership.io/v1
+kind: SchemaBinding
+metadata:
+  name: {{ .Values.schemaBinding.name }}
+  labels: { app.kubernetes.io/instance: {{ .Release.Name }} }
+spec:
+  # The CHART owns spec.schemaVersion. The fixed operator writes only .status, so there is no
+  # SSA ownership contention here. (The broken operator would co-own this field -> conflict.)
+  schemaVersion: {{ .Values.schemaBinding.schemaVersion | quote }}

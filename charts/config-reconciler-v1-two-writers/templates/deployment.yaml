@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-config-reconciler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-config-reconciler
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-config-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-config-reconciler
+roleRef:
+  kind: Role
+  name: {{ .Release.Name }}-config-reconciler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-config-reconciler
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: {{ .Release.Name }}-config-reconciler }
+  template:
+    metadata:
+      labels: { app: {{ .Release.Name }}-config-reconciler }
+    spec:
+      serviceAccountName: {{ .Release.Name }}-config-reconciler
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: SOURCE_CONFIGMAP
+              value: {{ .Values.sourceConfigMap | quote }}
+            - name: TARGET_CONFIGMAP
+              value: {{ .Values.targetConfigMap | quote }}
+            - name: OWNED_KEY
+              value: {{ .Values.ownedKey | quote }}
