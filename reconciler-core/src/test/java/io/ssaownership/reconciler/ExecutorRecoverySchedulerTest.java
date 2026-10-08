@@ -4,7 +4,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.time.Duration;
-import java.util.concurrent.Callable;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -64,6 +63,7 @@ class ExecutorRecoverySchedulerTest {
         try {
             ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(rec);
             s.schedule(Duration.ZERO, () -> {});
+            assertEquals(TimeUnit.MILLISECONDS, rec.lastUnit.get(), "unit must be milliseconds");
             assertEquals(0L, rec.lastDelay.get(), "zero stays zero (not bumped to 1ms)");
         } finally {
             rec.shutdownNow();
@@ -76,6 +76,7 @@ class ExecutorRecoverySchedulerTest {
         try {
             ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(rec);
             s.schedule(Duration.ofNanos(1_900_000), () -> {});    // 1.9 ms
+            assertEquals(TimeUnit.MILLISECONDS, rec.lastUnit.get(), "unit must be milliseconds");
             assertEquals(1L, rec.lastDelay.get(), "1.9ms truncates to 1ms (toMillis), not up to 2ms");
         } finally {
             rec.shutdownNow();

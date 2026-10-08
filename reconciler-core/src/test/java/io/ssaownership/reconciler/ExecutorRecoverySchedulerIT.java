@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Timeout;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -78,6 +79,25 @@ class ExecutorRecoverySchedulerIT {
             exec.shutdownNow();
             assertTrue(exec.awaitTermination(5, TimeUnit.SECONDS), "executor must terminate");
         }
+    }
+
+    @Test @Timeout(10)
+    void owning_scheduler_shuts_down_its_own_executor_on_close() throws Exception {
+        // createOwning() OWNS its executor; close() must shut that executor down (and then reject
+        // further scheduling). Contrast with the shared-executor test above, where close() is a
+        // no-op. This closes the previously STRUCT-only ownership gap with a direct assertion.
+        ExecutorRecoveryScheduler s = ExecutorRecoveryScheduler.createOwning("owned-test");
+        CountDownLatch ran = new CountDownLatch(1);
+        s.schedule(Duration.ofMillis(1), ran::countDown);
+        assertTrue(ran.await(5, TimeUnit.SECONDS), "owned scheduler runs tasks before close");
+
+        s.close();                                        // must shut down the OWNED executor
+
+        // After close, scheduling must be rejected because the owned executor is shut down.
+        RejectedExecutionException ex = assertThrows(RejectedExecutionException.class,
+                () -> s.schedule(Duration.ofMillis(1), () -> {}),
+                "an owned scheduler must reject scheduling after close() shuts its executor down");
+        assertNotNull(ex);
     }
 
     @Test @Timeout(10)

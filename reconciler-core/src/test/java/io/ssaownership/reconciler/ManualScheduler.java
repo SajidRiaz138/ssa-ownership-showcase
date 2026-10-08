@@ -11,12 +11,21 @@ import java.util.List;
  * what protects against stale work. No clock, no sleeps.
  *
  * <h2>Threading restriction</h2>
- * This fake is intended for SINGLE-THREADED driving: the test thread calls {@code schedule} and
- * the {@code run*} methods. Its bookkeeping is NOT synchronised and must not be driven
- * concurrently. Tests that need a scheduler across threads (handle-publication / rejection
- * orderings) use {@code ControllableScheduler}, which is synchronised. In all cases a task BODY is
- * executed WITHOUT holding any bookkeeping lock, so a task that re-enters the lifecycle cannot
- * deadlock against the scheduler.
+ * This fake performs NO internal synchronisation of its bookkeeping ({@code scheduled},
+ * {@code run}, {@code cancelled}). Two usage patterns are permitted:
+ * <ul>
+ *   <li>Single-threaded driving: the test thread calls {@code schedule} and the {@code run*}
+ *       methods.</li>
+ *   <li>Ordered cross-thread handoff: a {@code run*} method may be invoked from a different thread
+ *       (e.g. the authorization-gap test runs a recovery task on a worker) PROVIDED the test
+ *       establishes a happens-before edge — via latches/Futures — so that no two threads touch the
+ *       bookkeeping concurrently. Each field is written by one thread and read by another only
+ *       across such an edge.</li>
+ * </ul>
+ * UNSYNCHRONISED CONCURRENT access to the bookkeeping is prohibited; tests that need a genuinely
+ * concurrent scheduler (handle-publication / rejection orderings) use {@code ControllableScheduler}
+ * instead, which synchronises its state. In all cases a task BODY is executed WITHOUT holding any
+ * lock, so a task that re-enters the lifecycle cannot deadlock against the scheduler.
  */
 final class ManualScheduler implements RecoveryScheduler {
 

@@ -11,8 +11,8 @@ import java.time.Duration;
  * <h2>Contract</h2>
  * <ul>
  *   <li>{@link #schedule} runs {@code task} after approximately {@code delay}, on an EXECUTOR
- *       thread — never inline on the scheduling caller's stack. (The backing executor may be
- *       shared and is deliberately not owned by the scheduler.)</li>
+ *       thread — never inline on the scheduling caller's stack. (Executor ownership is
+ *       implementation-specific; a shared executor remains externally owned.)</li>
  *   <li>The returned {@link Cancellable#cancel()} is <b>best-effort</b>: a task already running
  *       cannot be un-run. The lifecycle's own eligibility check (is this recovery still the
  *       current reservation of an active lifecycle?) is the correctness mechanism; cancellation

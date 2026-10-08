@@ -86,4 +86,28 @@ class ConfigReconcilerAppIT {
             assertTrue(await(() -> "v2".equals(targetValue()), 20), "app should repair drift back to v2, was " + targetValue());
         }
     }
+
+    @Test @Timeout(60)
+    void reconcile_on_reinstall_repairs_drift_without_a_source_event() throws Exception {
+        // Reconcile-on-(re)install resync: a watch (re)install must itself trigger a reconcile, so
+        // that a change missed while disconnected is corrected on reconnect rather than waiting for
+        // the next source event. This drives the SAME watchSource() reconcile-on-install path a
+        // recovery uses (reconciler-core's race tests prove a scheduled recovery reaches install);
+        // here we drive a (re)install explicitly, drift the target with NO source event, and assert
+        // the (re)install's own reconcile repairs it.
+        try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key)) {
+            app.start();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20), "initial enforce v1, was " + targetValue());
+
+            // External drift of the owned key, deliberately WITHOUT touching the source (no event):
+            client.configMaps().inNamespace(ns).withName(target)
+                    .edit(c -> new ConfigMapBuilder(c).addToData(key, "drift-no-event").build());
+            assertEquals("drift-no-event", targetValue(), "precondition: target drifted");
+
+            // A (re)install (as recovery would perform) must schedule a reconcile on its own:
+            app.lifecycle().registerWatch();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20),
+                    "the (re)install's own reconcile must repair drift without any source event, was " + targetValue());
+        }
+    }
 }

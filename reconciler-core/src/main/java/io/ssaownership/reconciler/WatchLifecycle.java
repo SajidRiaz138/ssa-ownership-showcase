@@ -24,7 +24,8 @@ import java.util.concurrent.locks.ReentrantLock;
  *   createAndInstall(attempt):
  *     factory.create(...)                    // OUTSIDE the lock
  *     under lock: install candidate IFF attempt is still the current authorized attempt
- *                 AND not shut down AND candidate didn't self-close; else reject
+ *                 AND not shut down AND its close notification has not invalidated the attempt;
+ *                 else reject
  *     closeQuietly(rejected/superseded)      // OUTSIDE the lock
  * </pre>
  *
@@ -193,7 +194,8 @@ public final class WatchLifecycle {
             // ordering is handled, not prevented. This is a probe-free distinction between physical
             // termination and lifecycle-observed termination.
             if (health == Health.DEACTIVATED || attempt.generation != generation) {
-                // Invariant 2 & 6: superseded, shut down, or self-closed. Reject this candidate.
+                // Invariant 2 & 6: superseded, shut down, or its close notification already
+                // invalidated this attempt. Reject this candidate.
                 LOG.info("[{}] candidate gen {} rejected (health={}, current={})",
                         name, attempt.generation, health, generation);
                 toClose = candidate;

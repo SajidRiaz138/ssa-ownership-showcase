@@ -136,8 +136,9 @@ These are the only two rows marked DEMO; every other row is BEHAV or STRUCT and 
 
 ## Verification (this revision)
 reconciler-core: **42 unit tests** (23 `WatchLifecycleTest` + 15 `ReconcilerTest` +
-4 `ExecutorRecoverySchedulerTest`) and **5 integration tests** (`ExecutorRecoverySchedulerIT`),
-all passing on JDK 21 / Maven 3.9.10. The two DEMO regressions fail against the mutated code and
-pass against this revision (messages above). Fakes (`ManualScheduler`, `InMemoryStore`) are
-single-threaded and prove protocol logic only; the real executor is exercised by the IT suite and
-the recording-executor unit tests.
+4 `ExecutorRecoverySchedulerTest`) and **6 integration tests** (`ExecutorRecoverySchedulerIT`,
+including the owning-scheduler executor-shutdown assertion), all passing on JDK 21 /
+Maven 3.9.10. The two DEMO regressions fail against the mutated code and pass against this
+revision (messages in docs/mutation-evidence.md). Fakes (`ManualScheduler`, `InMemoryStore`) are
+driven single-threaded or via ordered cross-thread handoff with explicit happens-before; the real
+executor is exercised by the IT suite and the recording-executor unit tests.
