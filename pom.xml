@@ -25,6 +25,8 @@
     <slf4j.version>2.0.13</slf4j.version>
     <logback.version>1.5.6</logback.version>
     <mockito.version>5.11.0</mockito.version>
+    <!-- live-integration switch; the live-it profile overrides to true -->
+    <ssa.it.requireCluster>false</ssa.it.requireCluster>
   </properties>
 
   <dependencyManagement>
@@ -75,10 +77,48 @@
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-failsafe-plugin</artifactId>
+          <version>3.2.5</version>
+          <configuration>
+            <!-- Propagate the live-integration switch to the ITs. Default false: ITs self-skip
+                 when no cluster is reachable (convenient locally). The live-it profile sets it
+                 true, which makes the ITs REFUSE to skip — an unreachable cluster then FAILS. -->
+            <systemPropertyVariables>
+              <ssa.it.requireCluster>${ssa.it.requireCluster}</ssa.it.requireCluster>
+            </systemPropertyVariables>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-shade-plugin</artifactId>
           <version>3.5.3</version>
         </plugin>
       </plugins>
     </pluginManagement>
   </build>
+
+  <profiles>
+    <profile>
+      <!-- Mandatory, diagnostic integration run: ITs must execute and must not silently skip.
+           Usage: ./mvnw verify -Plive-it   (requires a reachable cluster). The required CI job
+           runs this profile and additionally asserts the expected IT classes executed. -->
+      <id>live-it</id>
+      <properties>
+        <ssa.it.requireCluster>true</ssa.it.requireCluster>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <!-- Fail the build if NO integration tests ran under the mandatory profile. -->
+              <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
+              <failIfNoTests>true</failIfNoTests>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

@@ -25,8 +25,11 @@ import static org.junit.jupiter.api.Assertions.*;
 class KubeConfigMapStoreIT {
 
     static boolean clusterAvailable() {
+        if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster"))) {
+            return true;   // live-it profile: do NOT skip — a real connection failure must surface
+        }
         try (KubernetesClient c = new KubernetesClientBuilder().build()) {
-            c.namespaces().list();      // a cheap call that fails fast if no cluster
+            c.getKubernetesVersion();   // cheap, works for namespace-scoped creds (not namespaces().list())
             return true;
         } catch (Exception e) {
             return false;
@@ -107,14 +110,89 @@ class KubeConfigMapStoreIT {
     }
 
     @Test @Timeout(60)
-    void conflict_retry_exhaustion_throws() {
+    void conflict_retry_exhaustion_throws_immediately_with_zero_retries() {
         createCm(Map.of());
-        // seam inserts a DIFFERENT value on every attempt via a changing suffix -> perpetual 409.
-        int[] n = {0};
-        Runnable alwaysConflict = () -> client.configMaps().inNamespace(ns).withName(cm)
-                .edit(c -> new ConfigMapBuilder(c).addToData("churn", "v" + (n[0]++)).build());
-        // retries=0 so the first conflict exhausts immediately
-        KubeConfigMapStore store = new KubeConfigMapStore(client, ns, 0, alwaysConflict);
-        assertThrows(ConfigMapStore.StoreException.class, () -> store.putIfAbsent(cm, key, "x"));
+        // retries=0: the FIRST conflict exhausts immediately. The pre-write seam fires only on
+        // attempt 0 (by design), so a single injected concurrent insert is enough to force the
+        // one-and-only write to conflict. This validates immediate exhaustion, not multi-retry
+        // exhaustion (which would require per-attempt injection the single seam does not provide).
+        Runnable concurrentInsert = () -> client.configMaps().inNamespace(ns).withName(cm)
+                .edit(c -> new ConfigMapBuilder(c).addToData(key, "other-writer").build());
+        KubeConfigMapStore store = new KubeConfigMapStore(client, ns, 0, concurrentInsert);
+        // The concurrent insert makes the key present, so after the 409 re-read the adapter would
+        // normally return false; with retries=0 the conflict path exhausts first. Either way it
+        // must not silently succeed with OUR value:
+        boolean wrote;
+        try {
+            wrote = store.putIfAbsent(cm, key, "app-default");
+        } catch (ConfigMapStore.StoreException expected) {
+            wrote = false;   // exhaustion path
+        }
+        assertFalse(wrote, "must not report having written our value");
+        assertEquals("other-writer", store.get(cm, key).orElseThrow(), "the other writer's value stands");
+    }
+
+    @Test @Timeout(60)
+    void conflict_from_unrelated_update_is_resolved_by_reread_then_insert() {
+        // A conflict caused by an UNRELATED change (not our key) with retries available: the write
+        // hits 409, the adapter re-reads (seeing our key still absent) and inserts it, preserving
+        // the unrelated change. Seam fires on attempt 0 only, so exactly one 409 then success.
+        createCm(Map.of("other", "v0"));
+        Runnable unrelatedBump = () -> client.configMaps().inNamespace(ns).withName(cm)
+                .edit(c -> new ConfigMapBuilder(c).addToData("other", "v1").build());
+        KubeConfigMapStore store = new KubeConfigMapStore(client, ns, 5, unrelatedBump);
+
+        boolean wrote = store.putIfAbsent(cm, key, "app-default");
+        assertTrue(wrote, "our key was absent; after re-read it must be inserted");
+        var data = client.configMaps().inNamespace(ns).withName(cm).get().getData();
+        assertEquals("app-default", data.get(key), "our key inserted");
+        assertEquals("v1", data.get("other"), "the unrelated concurrent change is preserved");
+    }
+
+    @Test @Timeout(60)
+    void get_on_unreachable_api_throws_StoreException_not_absence() {
+        // A read failure must surface as StoreException, never be mapped to Optional.empty().
+        // Use a client pointed at a dead endpoint so the GET fails at the transport layer.
+        try (KubernetesClient dead = new KubernetesClientBuilder()
+                .withConfig(new io.fabric8.kubernetes.client.ConfigBuilder()
+                        .withMasterUrl("https://127.0.0.1:1")   // nothing listening
+                        .withConnectionTimeout(500).withRequestTimeout(500)
+                        .withWatchReconnectLimit(0).build())
+                .build()) {
+            ConfigMapStore store = new KubeConfigMapStore(dead, ns);
+            assertThrows(ConfigMapStore.StoreException.class, () -> store.get(cm, key),
+                    "a read failure must throw StoreException, not return empty");
+        }
+    }
+
+    @Test @Timeout(60)
+    void putIfAbsent_on_existing_empty_string_returns_false_and_preserves_it() {
+        createCm(Map.of(key, ""));                       // present, empty-string value
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);
+        assertFalse(store.putIfAbsent(cm, key, "would-overwrite"),
+                "an existing empty-string value is PRESENT; putIfAbsent must return false");
+        assertEquals("", store.get(cm, key).orElseThrow(), "the empty-string value is preserved");
+    }
+
+    @Test @Timeout(60)
+    void writes_preserve_labels_annotations_and_binaryData() {
+        // Create a CM with labels, annotations and binaryData; an upsert of our key must leave all
+        // of them untouched (writes touch only data.<key>).
+        client.configMaps().inNamespace(ns).resource(new ConfigMapBuilder()
+                .withNewMetadata().withName(cm)
+                    .addToLabels("team", "infra")
+                    .addToAnnotations("note", "keep")
+                .endMetadata()
+                .addToData("other", "x")
+                .addToBinaryData("blob", "aGVsbG8=")     // base64 "hello"
+                .build()).create();
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);
+        store.upsert(cm, key, "v");
+        var fresh = client.configMaps().inNamespace(ns).withName(cm).get();
+        assertEquals("v", fresh.getData().get(key));
+        assertEquals("x", fresh.getData().get("other"), "unrelated data key preserved");
+        assertEquals("infra", fresh.getMetadata().getLabels().get("team"), "label preserved");
+        assertEquals("keep", fresh.getMetadata().getAnnotations().get("note"), "annotation preserved");
+        assertEquals("aGVsbG8=", fresh.getBinaryData().get("blob"), "binaryData preserved");
     }
 }

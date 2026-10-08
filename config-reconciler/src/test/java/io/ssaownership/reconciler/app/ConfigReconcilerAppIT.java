@@ -12,6 +12,7 @@ import org.junit.jupiter.api.condition.EnabledIf;
 
 import java.util.Map;
 import java.util.UUID;
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
@@ -26,8 +27,11 @@ import static org.junit.jupiter.api.Assertions.*;
 class ConfigReconcilerAppIT {
 
     static boolean clusterAvailable() {
+        if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster"))) {
+            return true;   // live-it profile: do NOT skip — a real connection failure must surface
+        }
         try (KubernetesClient c = new KubernetesClientBuilder().build()) {
-            c.namespaces().list(); return true;
+            c.getKubernetesVersion(); return true;
         } catch (Exception e) { return false; }
     }
 
@@ -68,7 +72,7 @@ class ConfigReconcilerAppIT {
     }
 
     @Test @Timeout(60)
-    void app_enforces_derived_value_and_repairs_drift() throws Exception {
+    void app_enforces_derived_value_and_propagates_source_changes() throws Exception {
         try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key)) {
             app.start();
             // initial reconcile seeds the derived value from source.desired=v1
@@ -79,11 +83,32 @@ class ConfigReconcilerAppIT {
                     .edit(c -> new ConfigMapBuilder(c).addToData("desired", "v2").build());
             assertTrue(await(() -> "v2".equals(targetValue()), 20), "app should enforce v2, was " + targetValue());
 
-            // external drift on the target -> a reconcile pass must repair it
+            // external drift on the target -> an EXPLICITLY triggered pass repairs it. This proves
+            // repair WHEN a pass runs; autonomous repair is covered separately below.
             client.configMaps().inNamespace(ns).withName(target)
                     .edit(c -> new ConfigMapBuilder(c).addToData(key, "tampered").build());
-            app.reconcileNow();
-            assertTrue(await(() -> "v2".equals(targetValue()), 20), "app should repair drift back to v2, was " + targetValue());
+            app.triggerNow();
+            assertTrue(await(() -> "v2".equals(targetValue()), 20), "a triggered pass must repair drift to v2, was " + targetValue());
+        }
+    }
+
+    @Test @Timeout(60)
+    void periodic_resync_repairs_target_drift_autonomously() throws Exception {
+        // AUTONOMOUS enforcement: with a short resync interval, target-only drift (which the
+        // source watch never observes) is repaired by the coordinator's periodic resync — no
+        // source event, no manual trigger.
+        try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key,
+                Duration.ofSeconds(1), Duration.ofSeconds(1))) {
+            app.start();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20), "initial enforce v1, was " + targetValue());
+
+            client.configMaps().inNamespace(ns).withName(target)
+                    .edit(c -> new ConfigMapBuilder(c).addToData(key, "tampered").build());
+            assertEquals("tampered", targetValue(), "precondition: target drifted");
+
+            // Do NOT trigger and do NOT touch the source; the periodic resync must repair it.
+            assertTrue(await(() -> "v1".equals(targetValue()), 20),
+                    "periodic resync must repair target drift autonomously, was " + targetValue());
         }
     }
 

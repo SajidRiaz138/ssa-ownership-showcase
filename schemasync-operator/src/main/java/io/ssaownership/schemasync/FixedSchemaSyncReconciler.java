@@ -12,18 +12,26 @@ import org.slf4j.LoggerFactory;
  * FIXED SchemaSync operator.
  *
  * <p>It records OBSERVED state in {@code status} (via the /status subresource) and NEVER writes
- * {@code spec}. Under SSA its field manager owns only {@code status.*}; the chart owns
- * {@code spec.schemaVersion}. There is no overlap, so a chart apply never conflicts with the
- * operator — which is the correct ownership model.
+ * {@code spec}. The decisive architectural property is WHERE it writes: {@code status}, not
+ * {@code spec}. Because it never applies {@code spec}, it never contends with the chart's
+ * ownership of {@code spec.schemaVersion}, so a chart apply never conflicts with this operator.
+ *
+ * <p><b>Update semantics (precise).</b> {@link #reconcile} uses {@code updateStatus()} — a plain
+ * update of the {@code /status} subresource (optimistic-concurrency on resourceVersion). It is
+ * NOT a server-side apply and does NOT register {@link #FIELD_MANAGER} as an SSA owner of status.
+ * This class therefore does not claim SSA ownership of {@code status}; it claims only that it
+ * leaves {@code spec} untouched. (If strict SSA status ownership under a named manager were
+ * required, {@code reconcile} would instead do a server-side apply of {@code status} with
+ * {@code FIELD_MANAGER}; that is a deliberate non-goal here.)
  *
  * <h2>Ownership handoff (upgrade from the broken operator)</h2>
  * Simply ceasing to write {@code spec} does NOT relinquish an EXISTING server-side-apply field
  * ownership that the broken operator established on {@code spec.schemaVersion}. SSA ownership
  * persists until explicitly released. {@link #releaseStaleSpecOwnership} performs the handoff:
  * it re-applies as the SAME field manager with a patch that OWNS NOTHING in spec, which drops the
- * manager's claim on {@code spec.schemaVersion} WITHOUT deleting the field's value (another
- * manager — the chart — still owns it, so the value stays). This is the migration step a real
- * ".status migration" needs beyond the code change.
+ * manager's claim on {@code spec.schemaVersion} WITHOUT deleting the field's value — <b>but only
+ * because another manager (the chart) still owns that field's value</b>. See the precondition on
+ * {@link #releaseStaleSpecOwnership}.
  */
 public final class FixedSchemaSyncReconciler {
 
@@ -57,9 +65,15 @@ public final class FixedSchemaSyncReconciler {
 
     /**
      * Ownership handoff: drop this manager's SSA claim on {@code spec} established by the broken
-     * operator, WITHOUT deleting spec.schemaVersion (the chart still owns the value). Re-applying
-     * as the same manager with an empty spec removes the fields that manager previously owned in
-     * spec; fields owned by other managers (the chart) remain.
+     * operator, WITHOUT deleting spec.schemaVersion.
+     *
+     * <p><b>PRECONDITION (critical).</b> This is safe to use for migration ONLY when another
+     * manager (here, the chart) also owns {@code spec.schemaVersion}. Re-applying as this manager
+     * with an empty spec removes the fields THIS manager owned in spec; a field co-owned by the
+     * chart keeps the chart's value. If this operator were the SOLE owner of the field, dropping
+     * its claim could remove the value (or fail validation on a required field). Do not use this as
+     * a blind production migration without first confirming another owner exists — the SSA
+     * demonstration test asserts the value is preserved precisely because the chart co-owns it.
      */
     public void releaseStaleSpecOwnership(String name) {
         SchemaBinding emptyApply = new SchemaBinding();

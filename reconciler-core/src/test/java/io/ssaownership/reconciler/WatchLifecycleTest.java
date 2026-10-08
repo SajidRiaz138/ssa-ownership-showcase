@@ -378,7 +378,7 @@ class WatchLifecycleTest {
         final Object mon = new Object();
         Runnable lastTask;                       // guarded by mon
         Handle lastHandle;                       // guarded by mon
-        volatile boolean rejectNext = false;
+        private CountDownLatch captured = new CountDownLatch(1);  // counted down when a task is captured
         private CountDownLatch releaseSchedule;  // if set, schedule() blocks until counted down
         private boolean rejectOnRelease = false; // if set, the released schedule() throws instead of returning
 
@@ -395,8 +395,15 @@ class WatchLifecycleTest {
             return l;
         }
 
+        /** Block until a task has been handed to schedule() (replaces test spin loops). */
+        void awaitCaptured(long seconds) {
+            CountDownLatch c;
+            synchronized (mon) { c = captured; }
+            try { if (!c.await(seconds, TimeUnit.SECONDS)) throw new AssertionError("no task captured in time"); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+        }
+
         @Override public Cancellable schedule(Duration delay, Runnable task) {
-            if (rejectNext) { rejectNext = false; throw new ManualScheduler.RejectedException("rejected"); }
             CountDownLatch toAwait;
             boolean reject;
             Handle h = new Handle();
@@ -404,6 +411,7 @@ class WatchLifecycleTest {
                 lastTask = task; lastHandle = h;
                 toAwait = releaseSchedule; releaseSchedule = null;
                 reject = rejectOnRelease; rejectOnRelease = false;
+                captured.countDown();            // signal capture AFTER recording task+handle
             }
             if (toAwait != null) {
                 try { if (!toAwait.await(2, TimeUnit.SECONDS)) throw new AssertionError("schedule() not released"); }
@@ -436,9 +444,7 @@ class WatchLifecycleTest {
             // closing A calls scheduleRecovery, which will block inside schedule():
             Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
             // wait until the task was captured (schedule() entered):
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
-            assertNotNull(s.task(), "recovery task must have been handed to the scheduler");
+            s.awaitCaptured(2);
             // run the recovery task NOW, before schedule() has returned its handle:
             Future<?> runFut = runOnThread(pool, s.task());
             runFut.get(5, TimeUnit.SECONDS);                 // recovery installs B, consumes reservation
@@ -468,9 +474,7 @@ class WatchLifecycleTest {
             CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
             lc.registerWatch();                              // A
             Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
-            assertNotNull(s.task());
+            s.awaitCaptured(2);
             lc.registerWatch();                              // explicit B supersedes the reservation
             TestWatch b = installedWatch(f, lc);
             releaseSchedule.countDown();                     // schedule() returns the now-stale handle
@@ -494,9 +498,7 @@ class WatchLifecycleTest {
             CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
             lc.registerWatch();
             Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
-            assertNotNull(s.task());
+            s.awaitCaptured(2);
             lc.deactivate();                                 // shutdown while schedule() is blocked
             releaseSchedule.countDown();
             closeFut.get(5, TimeUnit.SECONDS);
@@ -523,9 +525,7 @@ class WatchLifecycleTest {
             CountDownLatch releaseSchedule = s.blockThenRejectNextSchedule();  // schedule() will throw on release
             lc.registerWatch();                              // A
             Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
-            assertNotNull(s.task(), "recovery was handed to the scheduler (blocked pre-return)");
+            s.awaitCaptured(2);
             lc.registerWatch();                              // explicit B supersedes reservation R
             TestWatch b = installedWatch(f, lc);
             releaseSchedule.countDown();                     // schedule() now throws the rejection
@@ -552,9 +552,7 @@ class WatchLifecycleTest {
             CountDownLatch releaseSchedule = s.blockThenRejectNextSchedule();
             lc.registerWatch();
             Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (s.task() == null && System.nanoTime() < deadline) Thread.onSpinWait();
-            assertNotNull(s.task());
+            s.awaitCaptured(2);
             lc.deactivate();                                 // terminal, while schedule() is blocked
             releaseSchedule.countDown();                     // schedule() throws the rejection now
             closeFut.get(5, TimeUnit.SECONDS);
@@ -644,6 +642,54 @@ class WatchLifecycleTest {
         IllegalArgumentException st = assertThrows(IllegalArgumentException.class,
                 () -> new WatchLifecycle("t", f, s, Duration.ofSeconds(1), Duration.ofSeconds(30), overflowNanos, System::nanoTime));
         assertTrue(st.getMessage().contains("stableResetAfter"), "must name stableResetAfter: " + st.getMessage());
+    }
+
+    @Test @Timeout(10)
+    void stale_handle_returning_while_a_newer_recovery_reservation_is_pending_leaves_it_intact() throws Exception {
+        // The newer work is a PENDING RECOVERY RESERVATION (not an installed watch). A's recovery
+        // R1 blocks in schedule() before returning its handle. R1's task runs and installs B; B
+        // then closes, reserving a NEWER recovery R2 (pending, scheduled via a fresh schedule()).
+        // Only then does R1's original schedule() return its now-stale handle. That stale handle
+        // must be cancelled and must NOT disturb R2; running R2 must still install a watch.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch release1 = s.blockNextScheduleReturn();   // R1's schedule() will block
+        try {
+            lc.registerWatch();                                  // A
+            Future<?> close1 = runOnThread(pool, () -> installedWatch(f, lc).close());  // -> R1 (schedule blocks)
+            s.awaitCaptured(2);
+            Runnable r1Task = s.task();
+            ControllableScheduler.Handle r1Handle = s.handle();
+
+            // Run R1's task now (before its handle returns): installs B.
+            runOnThread(pool, r1Task).get(5, TimeUnit.SECONDS);
+            TestWatch b = installedWatch(f, lc);
+
+            // B closes -> R2 reserved and scheduled on a FRESH schedule() (not blocked).
+            b.close();
+            assertTrue(lc.debugHasPendingRecovery(), "a newer recovery reservation R2 is pending");
+            ControllableScheduler.Handle r2Handle = s.handle();
+            Runnable r2Task = s.task();
+            assertNotSame(r1Handle, r2Handle, "R2 has its own handle");
+
+            // Now let R1's ORIGINAL schedule() return its stale handle.
+            release1.countDown();
+            close1.get(5, TimeUnit.SECONDS);
+            assertTrue(r1Handle.cancelled(), "the stale R1 handle must be cancelled");
+            assertFalse(r2Handle.cancelled(), "R2's handle must NOT be cancelled");
+            assertTrue(lc.debugHasPendingRecovery(), "R2 remains pending and intact");
+
+            // Running R2 must still install a watch (the newer task executes successfully).
+            runOnThread(pool, r2Task).get(5, TimeUnit.SECONDS);
+            assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count(), "R2 installs a watch");
+            assertNoLeak(f, lc);
+        } finally {
+            release1.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     // ---- concurrency ------------------------------------------------------------------------

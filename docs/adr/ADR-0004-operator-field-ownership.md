@@ -30,15 +30,36 @@ correct fix.
   `spec.schemaVersion` WITHOUT deleting the value (the chart's manager still owns it, so the value
   survives). This is the migration step a real ".status migration" needs beyond the code change.
 
-## Verification (live SSA, `SchemaSyncOwnershipIT`, 3 tests)
+## Verification (live SSA, `SchemaSyncOwnershipIT`, 3 tests, with managedFields inspection)
 
-- `broken_operator_causes_a_chart_apply_conflict`: with the operator co-owning
-  `spec.schemaVersion`, a chart apply WITHOUT `--force-conflicts` fails with a real SSA conflict.
-- `fixed_operator_does_not_conflict_and_writes_status`: the status-only operator records observed
-  state; the chart changes its own field with no conflict.
-- `ownership_handoff_drops_stale_spec_claim_but_preserves_the_value`: starting from the broken
-  state (chart apply conflicts), the handoff drops the stale claim, the chart's `spec.schemaVersion`
-  VALUE is preserved, and a subsequent chart apply is conflict-free.
+The tests inspect ACTUAL `managedFields` (named managers), assert the real HTTP 409 code, and wait
+for the CRD's `Established=True` condition (bounded) rather than sleeping.
+
+- `broken_operator_causes_a_chart_apply_conflict_409_and_co_ownership_is_visible`: managedFields
+  show the chart owns `spec.schemaVersion`; after the broken operator applies, managedFields show
+  it CO-OWNS that field; a chart apply without `--force-conflicts` then fails with
+  `KubernetesClientException.getCode() == 409` (asserted exactly, not a permissive message match).
+- `fixed_operator_writes_status_only_and_introduces_no_spec_claim`: observed state is recorded in
+  `status`; managedFields show the operator owns NO spec field; the chart changes its field with
+  no conflict.
+- `ownership_handoff_drops_broken_spec_claim_but_chart_value_survives`: from the broken state
+  (asserted 409 precondition), the test first asserts the HANDOFF PRECONDITION — the chart still
+  co-owns the field — then the handoff removes the operator's spec claim (managedFields), the
+  chart's value survives, and a subsequent chart apply is conflict-free.
+
+### Precise update semantics (corrected)
+`FixedSchemaSyncReconciler.reconcile` uses `updateStatus()` — a plain update of the `/status`
+subresource (optimistic concurrency), NOT a server-side apply. It therefore does NOT register the
+`schemasync-operator` manager as an SSA owner of `status`; the claim verified here is only that it
+writes `status` and leaves `spec` untouched. Strict SSA status ownership under a named manager is a
+deliberate non-goal; if required, `reconcile` would server-side-apply `status` with the manager.
+
+### Handoff precondition (critical, documented + asserted)
+`releaseStaleSpecOwnership` preserves the value ONLY because another manager (the chart) still owns
+`spec.schemaVersion`. If the operator were the sole owner, dropping the claim could delete the
+field or fail validation. The handoff test asserts the chart co-owns the field before performing
+the handoff. (The `"helm"` manager name MODELS a chart writer; it does not verify the actual Helm
+CLI/version behaviour — that is the Helm-chart demo's concern.)
 
 ## Consequence
 This is the class of conflict a chart cannot fix alone. The real-world lesson: when an operator

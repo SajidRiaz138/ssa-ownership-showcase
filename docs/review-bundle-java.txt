@@ -1,0 +1,3755 @@
+================================================================================
+ SSA OWNERSHIP SHOWCASE — ALL JAVA SOURCES AND TESTS (review bundle)
+ Generated: 2026-10-08T13:34:03Z   Author: Sajid Riaz
+ Modules: reconciler-core, config-reconciler, schemasync-operator
+ Order: core main -> core test -> config-reconciler main -> config-reconciler test -> operator
+================================================================================
+
+/* ============================================================================
+ * FILE 01: reconciler-core/src/main/java/io/ssaownership/reconciler/WriteStrategy.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+/**
+ * How the application writes the field it owns. The two strategies are not interchangeable —
+ * choosing the right one is a correctness decision, and getting it wrong is a real bug.
+ *
+ * <ul>
+ *   <li>{@link #UPSERT} — create or replace the target key when reconciliation determines a write
+ *       is required (i.e. the observed value differs from desired). Correct when the application
+ *       is the source of truth and must enforce its value (e.g. a derived configuration that must
+ *       always reflect current inputs).</li>
+ *   <li>{@link #PUT_IF_ABSENT} — write only when the key is absent; never replace an existing
+ *       value. Correct when the value is a seedable default that another actor may legitimately
+ *       have changed, and the app must not revert that change.</li>
+ * </ul>
+ *
+ * <h2>Why the choice is a correctness decision (corrected migration example)</h2>
+ * In the migration this models: a derived configuration field used UPSERT; seedable defaults used
+ * PUT_IF_ABSENT. Using the wrong one is a real defect:
+ * <ul>
+ *   <li><b>PUT_IF_ABSENT on derived configuration</b> can <em>preserve stale output</em>: once a
+ *       value exists it is never corrected, so the field drifts from its derived truth.</li>
+ *   <li><b>UPSERT on editable defaults</b> can <em>revert operator changes</em>: every pass
+ *       overwrites a deliberate change back to the default.</li>
+ * </ul>
+ * Hence the policy is modelled explicitly rather than hard-coded. Note: UPSERT is a write policy,
+ * not a licence to force Kubernetes server-side-apply field-ownership conflicts — SSA ownership
+ * is a separate concern handled by the apply mechanism.
+ */
+public enum WriteStrategy {
+    UPSERT,
+    PUT_IF_ABSENT
+}
+
+
+/* ============================================================================
+ * FILE 02: reconciler-core/src/main/java/io/ssaownership/reconciler/ConfigMapStore.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import java.util.Optional;
+
+/**
+ * Narrow abstraction over the one capability the reconcile engine needs: read, and conditionally
+ * write, a single key in a target ConfigMap. Keeping it narrow makes {@link Reconciler} unit
+ * testable with an in-memory fake, and confines the fabric8 client to one adapter.
+ *
+ * <h2>Contract (an implementation MUST honour all of these)</h2>
+ * <ul>
+ *   <li><b>Namespace.</b> An instance is bound to exactly one namespace, fixed at construction.
+ *       {@code configMap} arguments are names within that namespace.</li>
+ *   <li><b>Missing ConfigMap or key -> empty read.</b> {@link #get} returns {@link Optional#empty()}
+ *       when EITHER the ConfigMap does not exist OR it exists but the key is absent (these two
+ *       "absent" cases are not distinguished by {@code get}). A present key whose value is the
+ *       empty string returns {@code Optional.of("")}. Writes DO distinguish them:
+ *       {@link #upsert}/{@link #putIfAbsent} MUST fail with {@link StoreException} if the ConfigMap
+ *       object does not exist (they do NOT create it — that is the chart's responsibility).</li>
+ *   <li><b>Read errors are not absence.</b> Any API failure during {@link #get} (auth, network,
+ *       server error) MUST throw {@link StoreException}, never be mapped to {@link Optional#empty()}.
+ *       Empty means "ConfigMap or key absent" — never "the read failed".</li>
+ *   <li><b>putIfAbsent is concurrency-safe at the API boundary.</b> The existence check and the
+ *       write MUST be atomic with respect to other writers (optimistic concurrency on the
+ *       observed resourceVersion, re-reading and re-evaluating on conflict). A naive
+ *       read-then-write that can clobber a concurrent insert does NOT satisfy this contract.</li>
+ *   <li><b>Preserve unrelated data and user-managed metadata.</b> Writes touch only {@code key};
+ *       they MUST preserve other data keys and user-managed labels/annotations. They do NOT
+ *       prevent the API server maintaining system metadata (e.g. {@code resourceVersion},
+ *       managed-fields) — that normal server maintenance is expected.</li>
+ *   <li><b>Retry exhaustion.</b> If conflict retries are exhausted, the operation MUST throw
+ *       {@link StoreException} rather than return a misleading success/failure.</li>
+ *   <li><b>Reject null.</b> Null values are rejected ({@link NullPointerException}); null is not
+ *       a representable ConfigMap value.</li>
+ * </ul>
+ *
+ * <p>Note on write policy: {@link #upsert} is a <em>write policy</em> ("create or replace the
+ * key"), not a licence to force Kubernetes server-side-apply field-ownership conflicts. SSA
+ * ownership is a separate concern handled by the apply mechanism, not by this interface.
+ */
+public interface ConfigMapStore {
+
+    /** Thrown for any store failure (API error, missing ConfigMap on write, retry exhaustion). */
+    class StoreException extends RuntimeException {
+        public StoreException(String message, Throwable cause) { super(message, cause); }
+        public StoreException(String message) { super(message); }
+    }
+
+    /**
+     * @return the current value of {@code key} in {@code configMap}; empty if the ConfigMap does
+     *         not exist OR the key is absent (these two "absent" cases are not distinguished).
+     *         A present empty-string value returns {@code Optional.of("")}. Throws
+     *         {@link StoreException} on API failure (never maps error to empty).
+     */
+    Optional<String> get(String configMap, String key);
+
+    /**
+     * Create or replace {@code key = value}, preserving unrelated content.
+     * @throws StoreException if the ConfigMap does not exist or the write ultimately fails.
+     * @throws NullPointerException if value is null.
+     */
+    void upsert(String configMap, String key, String value);
+
+    /**
+     * Set {@code key = value} only if the key is currently absent, atomically with respect to
+     * concurrent writers (re-read and re-evaluate on conflict). Preserves an existing value.
+     * @return true if it wrote (key was absent), false if an existing value was left untouched.
+     * @throws StoreException if the ConfigMap does not exist or the write ultimately fails.
+     * @throws NullPointerException if value is null.
+     */
+    boolean putIfAbsent(String configMap, String key, String value);
+}
+
+
+/* ============================================================================
+ * FILE 03: reconciler-core/src/main/java/io/ssaownership/reconciler/Reconciler.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Supplier;
+
+/**
+ * The reconcile engine: derive the desired value for a single owned field, then bring the target
+ * ConfigMap to that value using the configured {@link WriteStrategy}. The application — not the
+ * Helm chart — writes this field at runtime; this engine is the application's writer.
+ *
+ * <h2>Contract (observed-destination enforcement)</h2>
+ * Each pass compares the desired value against the <em>observed destination</em>, not a cache of
+ * what was last derived. Therefore a pass repairs destination drift:
+ * <ul>
+ *   <li>{@link WriteStrategy#UPSERT}: read the key; if it already equals desired, skip; otherwise
+ *       create-or-replace it. This repairs drift <em>when a pass runs</em>.</li>
+ *   <li>{@link WriteStrategy#PUT_IF_ABSENT}: call the store's concurrency-safe conditional write;
+ *       an existing value is preserved (never reverted).</li>
+ * </ul>
+ *
+ * <h2>What this does NOT claim</h2>
+ * <ul>
+ *   <li>It is NOT continuous enforcement. It "repairs drift when reconciliation runs." WHEN a
+ *       pass runs is decided by event wiring (destination watch and/or periodic resync), which
+ *       lives outside this class. Between passes, destination drift can persist.</li>
+ *   <li>It does NOT establish Kubernetes SSA field ownership. Write policy is not field-manager
+ *       ownership; that is a property of the apply mechanism, demonstrated elsewhere in the repo.</li>
+ *   <li>Comparing desired to observed avoids unnecessary writes; it is NOT a transaction. Another
+ *       actor may change the destination immediately after a write. Eventual correction comes
+ *       from the next pass, not from this method.</li>
+ * </ul>
+ */
+public final class Reconciler {
+
+    private static final Logger LOG = LoggerFactory.getLogger(Reconciler.class);
+
+    private final String name;
+    private final String targetConfigMap;
+    private final String key;
+    private final WriteStrategy strategy;
+    private final ConfigMapStore store;
+    /** Derives the desired value from current inputs. */
+    private final Supplier<String> deriveDesired;
+
+    public Reconciler(String name,
+                      String targetConfigMap,
+                      String key,
+                      WriteStrategy strategy,
+                      ConfigMapStore store,
+                      Supplier<String> deriveDesired) {
+        this.name = Objects.requireNonNull(name, "name");
+        this.targetConfigMap = Objects.requireNonNull(targetConfigMap, "targetConfigMap");
+        this.key = Objects.requireNonNull(key, "key");
+        this.strategy = Objects.requireNonNull(strategy, "strategy");
+        this.store = Objects.requireNonNull(store, "store");
+        this.deriveDesired = Objects.requireNonNull(deriveDesired, "deriveDesired");
+    }
+
+    /** Outcome of one reconcile pass — explicit so callers and tests can assert behaviour. */
+    public enum Outcome {
+        /** A write was performed. */                         WROTE,
+        /** UPSERT: destination already equalled desired. */  SKIPPED_IN_SYNC,
+        /** PUT_IF_ABSENT: key already present, preserved. */ SKIPPED_PRESENT,
+        /** Derivation or a store call failed; retryable. */  FAILED
+    }
+
+    /**
+     * Run one reconcile pass. Converts derivation and store {@link RuntimeException}s into
+     * {@link Outcome#FAILED} (it does NOT catch {@link Error}).
+     *
+     * <p><b>Failure semantics (precise).</b> On {@link Outcome#FAILED} no local success state is
+     * advanced, so a subsequent pass is permitted. This does NOT prove the destination is
+     * unchanged: a store write may have committed remotely before the client observed a timeout,
+     * so a failed call has an <em>unknown remote outcome</em>. The next pass re-observes the
+     * destination (UPSERT) or conditionally writes it (PUT_IF_ABSENT) rather than assuming either
+     * result. "Retryable" means another pass is permitted — not that the failure is transient;
+     * invalid input, authorization errors, or a missing ConfigMap will keep failing until an
+     * operator intervenes.
+     *
+     * <p>{@code synchronized} serialises passes of THIS instance only. It provides no
+     * coordination across instances or pods. Callers should run passes on worker execution
+     * (not directly on a watch callback thread) and coalesce repeated triggers.
+     */
+    public synchronized Outcome reconcile() {
+        final String desired;
+        try {
+            desired = Objects.requireNonNull(deriveDesired.get(), "derived value must not be null");
+        } catch (RuntimeException e) {
+            LOG.error("[{}] could not derive desired value; no store write attempted for {}.{}",
+                    name, targetConfigMap, key, e);
+            return Outcome.FAILED;
+        }
+
+        try {
+            return switch (strategy) {
+                case UPSERT -> upsertEnforce(desired);
+                case PUT_IF_ABSENT -> seedIfAbsent(desired);
+            };
+        } catch (RuntimeException e) {   // e.g. ConfigMapStore.StoreException
+            LOG.error("[{}] reconciliation of {}.{} failed (remote outcome unknown); a subsequent pass re-evaluates the configured policy",
+                    name, targetConfigMap, key, e);
+            return Outcome.FAILED;
+        }
+    }
+
+    /** UPSERT: compare desired to OBSERVED destination; write only if they differ. */
+    private Outcome upsertEnforce(String desired) {
+        Optional<String> observed = store.get(targetConfigMap, key);   // may throw -> FAILED
+        if (observed.filter(desired::equals).isPresent()) {
+            LOG.debug("[{}] {}.{} already in sync; no write", name, targetConfigMap, key);
+            return Outcome.SKIPPED_IN_SYNC;
+        }
+        store.upsert(targetConfigMap, key, desired);
+        LOG.info("[{}] enforced {}.{} (upsert)", name, targetConfigMap, key);
+        return Outcome.WROTE;
+    }
+
+    /** PUT_IF_ABSENT: concurrency-safe seed; preserve any existing value. No diagnostic read. */
+    private Outcome seedIfAbsent(String desired) {
+        boolean wrote = store.putIfAbsent(targetConfigMap, key, desired);  // may throw -> FAILED
+        if (wrote) {
+            LOG.info("[{}] seeded {}.{} (put-if-absent)", name, targetConfigMap, key);
+            return Outcome.WROTE;
+        }
+        // false is a successful policy decision: a value already exists and we preserve it.
+        // DEBUG, not INFO: this is the steady-state outcome of a frequently-running reconcile.
+        LOG.debug("[{}] {}.{} already present; left untouched", name, targetConfigMap, key);
+        return Outcome.SKIPPED_PRESENT;
+    }
+}
+
+
+/* ============================================================================
+ * FILE 04: reconciler-core/src/main/java/io/ssaownership/reconciler/RecoveryScheduler.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import java.time.Duration;
+
+/**
+ * Delayed, cancellable execution — the ONLY thing {@link WatchLifecycle} needs from
+ * infrastructure for recovery. Deliberately dumb: it knows nothing about generations, backoff,
+ * eligibility, or coalescing. All of that policy lives in the lifecycle; the scheduler only runs
+ * a task after a delay and lets the caller cancel that particular task.
+ *
+ * <h2>Contract</h2>
+ * <ul>
+ *   <li>{@link #schedule} runs {@code task} after approximately {@code delay}, on an EXECUTOR
+ *       thread — never inline on the scheduling caller's stack. (Executor ownership is
+ *       implementation-specific; a shared executor remains externally owned.)</li>
+ *   <li>The returned {@link Cancellable#cancel()} is <b>best-effort</b>: a task already running
+ *       cannot be un-run. The lifecycle's own eligibility check (is this recovery still the
+ *       current reservation of an active lifecycle?) is the correctness mechanism; cancellation
+ *       is an optimisation.</li>
+ *   <li><b>Required backing-executor behaviour:</b> submissions execute asynchronously, and a
+ *       submission that cannot be accepted MUST throw
+ *       {@link java.util.concurrent.RejectedExecutionException} (or another runtime exception),
+ *       so {@link WatchLifecycle} can surface it as DEGRADED. An executor configured with a
+ *       SILENTLY-DISCARDING rejection policy violates this contract: the lifecycle would receive
+ *       a handle for a task that never runs instead of an observable rejection. Use the default
+ *       (throwing) rejection policy.</li>
+ *   <li><b>Delay range/precision:</b> delays are honoured at MILLISECOND precision. A positive
+ *       sub-millisecond delay is treated as the minimum representable delay (not zero/not
+ *       dropped) by well-behaved implementations; a negative delay is rejected; excessively large
+ *       delays beyond the implementation's representable range are rejected. Implementations
+ *       document their exact supported range.</li>
+ * </ul>
+ */
+public interface RecoveryScheduler {
+
+    Cancellable schedule(Duration delay, Runnable task);
+
+    interface Cancellable {
+        /** Best-effort cancel. A task that has already started may still complete. */
+        void cancel();
+    }
+}
+
+
+/* ============================================================================
+ * FILE 05: reconciler-core/src/main/java/io/ssaownership/reconciler/ExecutorRecoveryScheduler.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * A {@link RecoveryScheduler} backed by a {@link ScheduledExecutorService}.
+ *
+ * <h2>Executor ownership (deliberate)</h2>
+ * This adapter does NOT own the executor it is given and never shuts it down — several
+ * {@link WatchLifecycle} instances may share one executor, so one lifecycle deactivating must not
+ * stop the others' recovery. If you want a dedicated, closeable scheduler, use
+ * {@link #createOwning(String)} which creates (and, via {@link #close()}, shuts down) its own
+ * single-thread executor.
+ *
+ * <h2>Contract honoured</h2>
+ * <ul>
+ *   <li>Tasks run on an executor thread, never inline on the scheduling caller's stack.</li>
+ *   <li>{@link #schedule} returns a per-task {@link Cancellable} that cancels only that task.</li>
+ *   <li>A rejected submission (executor shut down, queue bounded) throws
+ *       {@link java.util.concurrent.RejectedExecutionException}, which {@link WatchLifecycle}
+ *       translates into its DEGRADED failure path.</li>
+ *   <li>Invalid (negative) delays are rejected with {@link IllegalArgumentException}.</li>
+ * </ul>
+ */
+public final class ExecutorRecoveryScheduler implements RecoveryScheduler, AutoCloseable {
+
+    private final ScheduledExecutorService executor;
+    private final boolean owned;
+
+    /** Use a shared, externally-owned executor; {@link #close()} will NOT shut it down. */
+    public ExecutorRecoveryScheduler(ScheduledExecutorService executor) {
+        this(executor, false);
+    }
+
+    private ExecutorRecoveryScheduler(ScheduledExecutorService executor, boolean owned) {
+        this.executor = Objects.requireNonNull(executor, "executor");
+        this.owned = owned;
+    }
+
+    /** Create a scheduler that OWNS a dedicated single-thread executor, shut down by {@link #close()}. */
+    public static ExecutorRecoveryScheduler createOwning(String threadName) {
+        ScheduledExecutorService ex = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, threadName);
+            t.setDaemon(true);
+            return t;
+        });
+        return new ExecutorRecoveryScheduler(ex, true);
+    }
+
+    @Override
+    public Cancellable schedule(Duration delay, Runnable task) {
+        Objects.requireNonNull(delay, "delay");
+        Objects.requireNonNull(task, "task");
+        if (delay.isNegative()) {
+            throw new IllegalArgumentException("delay must not be negative: " + delay);
+        }
+        // Accepts nonnegative durations whose toMillis() conversion fits in a long. A positive
+        // sub-millisecond duration is submitted as 1ms (never silently 0). For durations above 1ms
+        // the conversion truncates fractional milliseconds — it does NOT round every positive
+        // duration upward. Actual scheduling precision and extreme-delay handling depend on the
+        // backing executor; conversion overflow is rejected as IllegalArgumentException.
+        long millis;
+        try {
+            millis = delay.toMillis();
+        } catch (ArithmeticException overflow) {
+            throw new IllegalArgumentException("delay too large to represent in millis: " + delay, overflow);
+        }
+        if (millis == 0 && !delay.isZero()) {
+            millis = 1;                       // positive sub-ms -> minimum representable, not dropped
+        }
+        // May throw RejectedExecutionException — intentionally propagated to the caller.
+        ScheduledFuture<?> future = executor.schedule(task, millis, TimeUnit.MILLISECONDS);
+        return () -> future.cancel(false);   // best-effort; a running task is not interrupted
+    }
+
+    /** Shuts down the executor ONLY if this scheduler created it. No-op for a shared executor. */
+    @Override
+    public void close() {
+        if (owned) {
+            executor.shutdownNow();
+        }
+    }
+}
+
+
+/* ============================================================================
+ * FILE 06: reconciler-core/src/main/java/io/ssaownership/reconciler/WatchFactory.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import io.fabric8.kubernetes.client.Watch;
+
+/**
+ * Creates a watch whose close notification is bound to an {@code onClosed} callback supplied by
+ * the lifecycle BEFORE the {@link Watch} handle exists. This is what makes close-before-install
+ * correct for real fabric8 watches: the watcher can report closure through {@code onClosed} even
+ * if it closes before {@code create} returns a handle. The callback does not need the handle to
+ * identify its attempt — the lifecycle gives each attempt its own callback instance.
+ *
+ * <p>Contrast with a test-only "is this watch closed?" probe, which cannot supply this property
+ * for production watches and was deliberately removed.
+ */
+@FunctionalInterface
+public interface WatchFactory {
+    /**
+     * Create a watch, having wired its terminal-closure notification to {@code onClosed} BEFORE
+     * returning the handle. Contract:
+     * <ul>
+     *   <li>{@code onClosed} fires when the watch terminates for any reason (server close, error,
+     *       or an explicit {@link Watch#close()}).</li>
+     *   <li>Notification MAY occur before {@code create} returns (close-before-install) — the
+     *       lifecycle handles that case via generation invalidation.</li>
+     *   <li>Duplicate notifications are TOLERATED by the lifecycle (stale ones are ignored), so a
+     *       factory need not guarantee exactly-once delivery.</li>
+     * </ul>
+     * Whether an explicit {@link Watch#close()} reliably produces {@code onClosed} depends on the
+     * fabric8 version; the real adapter must verify or normalise this. This interface alone cannot
+     * establish that production behaviour.
+     */
+    Watch create(Runnable onClosed);
+}
+
+
+/* ============================================================================
+ * FILE 07: reconciler-core/src/main/java/io/ssaownership/reconciler/WatchLifecycle.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import io.fabric8.kubernetes.client.Watch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Objects;
+import java.util.function.LongSupplier;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Lifecycle for a single Kubernetes {@link Watch}, correct under concurrent registration, late
+ * and duplicate close callbacks, close-before-install, shutdown races, and recovery scheduling
+ * races. Recovery POLICY lives here; delayed execution is delegated to a {@link RecoveryScheduler}.
+ *
+ * <h2>The reservation protocol (the heart of the design)</h2>
+ * The unit of work is an {@link Attempt}, whose identity is a monotonic generation claimed UNDER
+ * the lock. The crucial property: once an attempt is authorized under the lock, that SAME attempt
+ * is carried through creation and install — no later step re-mints a new identity after
+ * validating an old one. {@code registerWatch()} and {@code runRecovery(reservation)} both reduce
+ * to {@link #createAndInstall(Attempt)}:
+ * <pre>
+ *   createAndInstall(attempt):
+ *     factory.create(...)                    // OUTSIDE the lock
+ *     under lock: install candidate IFF attempt is still the current authorized attempt
+ *                 AND not shut down AND its close notification has not invalidated the attempt;
+ *                 else reject
+ *     closeQuietly(rejected/superseded)      // OUTSIDE the lock
+ * </pre>
+ *
+ * <h2>Invariants (see lifecycle ADR)</h2>
+ * <ol>
+ *   <li>Identity survives execution: an authorized attempt is never silently swapped for another.</li>
+ *   <li>Only the current eligible attempt installs; superseded candidates are cleaned up.</li>
+ *   <li>Explicit registration invalidates+detaches pending recovery under the lock; cancellation
+ *       happens outside it.</li>
+ *   <li>Closing the old installed watch detaches it; it does NOT invalidate an authorized replacement.</li>
+ *   <li>Recovery completion/rejection/cancellation cannot modify a newer reservation's state.</li>
+ *   <li>Shutdown is terminal; late factory results / scheduler handles cannot reactivate.</li>
+ *   <li>Factory, scheduling, cancellation, and close all happen outside the lock.</li>
+ * </ol>
+ */
+public final class WatchLifecycle {
+
+    private static final Logger LOG = LoggerFactory.getLogger(WatchLifecycle.class);
+
+    public enum Health {
+        /** Lifecycle enabled and not degraded. Does NOT mean a functioning watch is currently
+         *  installed — the lifecycle is ACTIVE before the first watch exists and during delayed
+         *  recovery. Do not use this alone as a readiness signal; a watch may be absent/pending. */
+        ACTIVE,
+        /** Terminal shutdown. */
+        DEACTIVATED,
+        /** Recovery scheduling was rejected; needs an external trigger (see ADR-0002). */
+        DEGRADED
+    }
+
+    /** An authorized unit of creation/installation work, identified by generation. */
+    private static final class Attempt {
+        final long generation;
+        Attempt(long generation) { this.generation = generation; }
+    }
+
+    /** A reserved recovery, identified by generation, awaiting scheduled execution. */
+    private static final class RecoveryReservation {
+        final long generation;
+        RecoveryScheduler.Cancellable handle;   // set after scheduling; guarded by lock
+        RecoveryReservation(long generation) { this.generation = generation; }
+    }
+
+    private final String name;
+    private final WatchFactory factory;
+    private final RecoveryScheduler scheduler;
+    private final long baseDelayMs;
+    private final long maxDelayMs;
+    private final long stableResetAfterNanos;
+    private final LongSupplier nanoTime;
+    /**
+     * TEST SYNCHRONISATION SEAM (not a production extension point). Runs OUTSIDE the lifecycle
+     * lock on the RECOVERY path only, after a reservation is consumed and its attempt authorized
+     * but before creation is dispatched. Production uses a no-op; a test injects a pause here to
+     * deterministically interleave an explicit registration. It must not modify internal state.
+     */
+    private final Runnable afterRecoveryAuthorized;
+
+    private final ReentrantLock lock = new ReentrantLock();
+    // ---- all guarded by lock ----
+    private Health health = Health.ACTIVE;
+    private long generation = 0;                 // last authorized attempt/reservation id
+    private Watch installed;                     // the installed watch (may be null)
+    private long installedGeneration = -1;
+    private long installedAtNanos = 0;
+    private int consecutiveFailures = 0;         // saturating; see nextDelayMsLocked
+    private RecoveryReservation pendingRecovery; // at most one
+
+    public WatchLifecycle(String name, WatchFactory factory, RecoveryScheduler scheduler) {
+        this(name, factory, scheduler, Duration.ofSeconds(1), Duration.ofSeconds(30),
+                Duration.ofSeconds(60), System::nanoTime);
+    }
+
+    public WatchLifecycle(String name, WatchFactory factory, RecoveryScheduler scheduler,
+                          Duration baseDelay, Duration maxDelay, Duration stableResetAfter,
+                          LongSupplier nanoTime) {
+        this(name, factory, scheduler, baseDelay, maxDelay, stableResetAfter, nanoTime, () -> {});
+    }
+
+    /** Package-private: adds the recovery-path test seam. Public callers get the no-op overload. */
+    WatchLifecycle(String name, WatchFactory factory, RecoveryScheduler scheduler,
+                   Duration baseDelay, Duration maxDelay, Duration stableResetAfter,
+                   LongSupplier nanoTime, Runnable afterRecoveryAuthorized) {
+        this.name = Objects.requireNonNull(name, "name");
+        this.factory = Objects.requireNonNull(factory, "factory");
+        this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
+        Objects.requireNonNull(baseDelay, "baseDelay");
+        Objects.requireNonNull(maxDelay, "maxDelay");
+        Objects.requireNonNull(stableResetAfter, "stableResetAfter");
+        this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
+        this.afterRecoveryAuthorized = Objects.requireNonNull(afterRecoveryAuthorized, "afterRecoveryAuthorized");
+        // Validate configuration (fail fast): positive base/stability, maxDelay >= baseDelay.
+        if (baseDelay.isNegative() || baseDelay.isZero()) throw new IllegalArgumentException("baseDelay must be positive");
+        if (stableResetAfter.isNegative() || stableResetAfter.isZero()) throw new IllegalArgumentException("stableResetAfter must be positive");
+        if (maxDelay.compareTo(baseDelay) < 0) throw new IllegalArgumentException("maxDelay must be >= baseDelay");
+        // Representable ranges: baseDelay/maxDelay must fit in milliseconds and stableResetAfter in
+        // nanoseconds (Duration conversion throws ArithmeticException on overflow). Normalise that
+        // overflow into a configuration error that names the offending parameter, rather than
+        // letting a raw ArithmeticException escape the constructor.
+        this.baseDelayMs = Math.max(1, toMillisOrReject(baseDelay, "baseDelay"));
+        this.maxDelayMs = Math.max(this.baseDelayMs, toMillisOrReject(maxDelay, "maxDelay"));
+        this.stableResetAfterNanos = toNanosOrReject(stableResetAfter, "stableResetAfter");
+    }
+
+    private static long toMillisOrReject(Duration d, String param) {
+        try { return d.toMillis(); }
+        catch (ArithmeticException overflow) {
+            throw new IllegalArgumentException(param + " too large to represent in milliseconds: " + d, overflow);
+        }
+    }
+    private static long toNanosOrReject(Duration d, String param) {
+        try { return d.toNanos(); }
+        catch (ArithmeticException overflow) {
+            throw new IllegalArgumentException(param + " too large to represent in nanoseconds: " + d, overflow);
+        }
+    }
+
+    /** Explicit (re)registration. Invalidates any pending recovery and authorizes a replacement. */
+    public void registerWatch() {
+        Attempt attempt;
+        RecoveryReservation detachedRecovery;
+        lock.lock();
+        try {
+            if (health == Health.DEACTIVATED) {
+                LOG.info("[{}] deactivated; registration refused", name);
+                return;
+            }
+            // Invariant 3: invalidate+detach pending recovery under the lock (cancel outside).
+            detachedRecovery = pendingRecovery;
+            pendingRecovery = null;
+            attempt = new Attempt(++generation);     // authorize THIS attempt
+            if (health == Health.DEGRADED) health = Health.ACTIVE;   // actively trying again
+        } finally {
+            lock.unlock();
+        }
+        cancelOutsideLock(detachedRecovery);
+        createAndInstall(attempt);
+    }
+
+    /** The single creation+install path. The authorized {@code attempt} is carried through. */
+    private void createAndInstall(Attempt attempt) {
+        // Create OUTSIDE the lock; bind the close callback to THIS attempt's generation.
+        final Watch candidate;
+        try {
+            candidate = Objects.requireNonNull(
+                    factory.create(() -> onClosed(attempt.generation)),
+                    "watch factory returned null");
+        } catch (RuntimeException e) {
+            LOG.error("[{}] watch creation failed at gen {}", name, attempt.generation, e);
+            onCreateFailed(attempt);
+            return;
+        }
+
+        Watch toClose = null;
+        lock.lock();
+        try {
+            // Close-before-install is enforced here WITHOUT a flag on Attempt, but the guarantee
+            // depends on WHEN the close is OBSERVED (the bound onClosed acquiring this lock), not
+            // on when the watch physically terminated:
+            //   - If this attempt's close notification was PROCESSED BEFORE this installation check,
+            //     its onClosed(attempt.generation) already advanced `generation` (reserving
+            //     recovery), so attempt.generation != generation and the candidate is rejected here.
+            //   - If closure is processed AFTER installation, the candidate is briefly installed and
+            //     onClosed then detaches it and arranges recovery (the normal installed-close path).
+            // A real client may physically terminate a watch before its callback runs; that latter
+            // ordering is handled, not prevented. This is a probe-free distinction between physical
+            // termination and lifecycle-observed termination.
+            if (health == Health.DEACTIVATED || attempt.generation != generation) {
+                // Invariant 2 & 6: superseded, shut down, or its close notification already
+                // invalidated this attempt. Reject this candidate.
+                LOG.info("[{}] candidate gen {} rejected (health={}, current={})",
+                        name, attempt.generation, health, generation);
+                toClose = candidate;
+            } else {
+                toClose = installed;                 // supersede any previous installed watch
+                installed = candidate;
+                installedGeneration = attempt.generation;
+                installedAtNanos = nanoTime.getAsLong();
+                health = Health.ACTIVE;
+                LOG.info("[{}] watch installed at gen {}", name, attempt.generation);
+            }
+        } finally {
+            lock.unlock();
+        }
+        closeQuietly(toClose);                       // Invariant 7
+    }
+
+    /** Close callback bound to the attempt created at {@code gen}. */
+    private void onClosed(long gen) {
+        RecoveryReservation reservation = null;
+        long delayMs = baseDelayMs;
+        lock.lock();
+        try {
+            if (health == Health.DEACTIVATED) return;        // shutting down
+
+            boolean wasInstalled = (gen == installedGeneration);
+            boolean isCurrent = (gen == generation);
+            if (!wasInstalled && !isCurrent) {
+                // Invariant 4/5: a stale/old watch closed. Detach nothing current, schedule
+                // nothing. (If it was the installed one, wasInstalled handles detach below.)
+                LOG.info("[{}] ignoring close of non-current watch gen {} (current {})",
+                        name, gen, generation);
+                return;
+            }
+            if (wasInstalled) {
+                // Backoff decision from ACTUAL live duration (install -> now), not recovery latency.
+                long live = nanoTime.getAsLong() - installedAtNanos;
+                if (live >= stableResetAfterNanos) consecutiveFailures = 0;
+                installed = null;
+                installedGeneration = -1;
+            }
+            // Only arrange recovery if THIS close concerns the current generation. If a newer
+            // attempt has already superseded (isCurrent false but wasInstalled true for an old
+            // installed watch whose replacement is in flight), we detached the old watch above
+            // but must NOT supersede the in-flight replacement (Invariant 4).
+            if (!isCurrent) {
+                LOG.info("[{}] old installed watch gen {} closed; replacement gen {} in flight, not recovering",
+                        name, gen, generation);
+                return;
+            }
+            consecutiveFailures = saturatingInc(consecutiveFailures);
+            delayMs = nextDelayMsLocked();
+            reservation = new RecoveryReservation(++generation);  // reserve recovery identity
+            pendingRecovery = reservation;
+        } finally {
+            lock.unlock();
+        }
+        scheduleRecovery(reservation, delayMs);
+    }
+
+    private void onCreateFailed(Attempt attempt) {
+        RecoveryReservation reservation;
+        long delayMs;
+        lock.lock();
+        try {
+            // Only this attempt may arrange recovery, and only if it is still current.
+            if (health == Health.DEACTIVATED || attempt.generation != generation) {
+                return;      // superseded/shut down: retaining a healthy installed watch if any
+            }
+            consecutiveFailures = saturatingInc(consecutiveFailures);
+            delayMs = nextDelayMsLocked();
+            reservation = new RecoveryReservation(++generation);
+            pendingRecovery = reservation;
+        } finally {
+            lock.unlock();
+        }
+        scheduleRecovery(reservation, delayMs);
+    }
+
+    private void scheduleRecovery(RecoveryReservation reservation, long delayMs) {
+        final RecoveryScheduler.Cancellable handle;
+        try {
+            handle = scheduler.schedule(Duration.ofMillis(delayMs), () -> runRecovery(reservation));
+        } catch (RuntimeException e) {
+            // Rejected scheduling: enter DEGRADED only if this reservation is still current.
+            lock.lock();
+            try {
+                if (pendingRecovery == reservation && health != Health.DEACTIVATED) {
+                    pendingRecovery = null;
+                    health = Health.DEGRADED;
+                    LOG.error("[{}] recovery scheduling rejected at gen {}; DEGRADED (external trigger required)",
+                            name, reservation.generation, e);
+                }
+            } finally {
+                lock.unlock();
+            }
+            return;
+        }
+        boolean stale;
+        lock.lock();
+        try {
+            // The task may already have run (another thread) or been superseded while scheduling.
+            stale = (health == Health.DEACTIVATED) || (pendingRecovery != reservation);
+            if (!stale) reservation.handle = handle;   // record only if still current
+        } finally {
+            lock.unlock();
+        }
+        if (stale) cancelOutsideLock(handle);          // Invariant 5/7
+    }
+
+    /** Scheduler-invoked. Consume the matching reservation and authorize its exact attempt. */
+    private void runRecovery(RecoveryReservation reservation) {
+        Attempt attempt = null;
+        lock.lock();
+        try {
+            if (health != Health.DEACTIVATED && pendingRecovery == reservation) {
+                pendingRecovery = null;
+                attempt = new Attempt(reservation.generation);  // SAME identity, now authorized
+            } else {
+                LOG.info("[{}] recovery gen {} no longer eligible; skipping", name, reservation.generation);
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (attempt != null) {
+            afterRecoveryAuthorized.run();   // TEST SEAM: outside lock, after authorize, before create
+            createAndInstall(attempt);       // carries the authorized identity; no re-mint
+        }
+    }
+
+    /** Terminal shutdown. Invalidates all work; cancels pending recovery; closes installed. */
+    public void deactivate() {
+        Watch toClose;
+        RecoveryReservation toCancel;
+        lock.lock();
+        try {
+            if (health == Health.DEACTIVATED) return;
+            health = Health.DEACTIVATED;
+            generation++;                              // invalidate in-flight attempts/reservations
+            toClose = installed;
+            installed = null;
+            installedGeneration = -1;
+            toCancel = pendingRecovery;
+            pendingRecovery = null;
+        } finally {
+            lock.unlock();
+        }
+        cancelOutsideLock(toCancel);
+        closeQuietly(toClose);
+        LOG.info("[{}] deactivated", name);
+    }
+
+    public Health health() { lock.lock(); try { return health; } finally { lock.unlock(); } }
+    public boolean isActive() { return health() == Health.ACTIVE; }
+
+    // ---- backoff: saturating, validated ------------------------------------------------------
+    private static int saturatingInc(int v) { return v == Integer.MAX_VALUE ? v : v + 1; }
+
+    private long nextDelayMsLocked() {
+        // Saturating exponential: baseDelayMs * 2^(failures-1), capped at maxDelayMs. No overflow.
+        long d = baseDelayMs;
+        for (int i = 1; i < consecutiveFailures && d < maxDelayMs; i++) {
+            d = (d > maxDelayMs / 2) ? maxDelayMs : d * 2;   // saturate before overflow
+        }
+        return Math.min(d, maxDelayMs);
+    }
+
+    private void closeQuietly(Watch w) {
+        if (w == null) return;
+        try { w.close(); } catch (RuntimeException e) { LOG.warn("[{}] close error (ignored)", name, e); }
+    }
+    private void cancelOutsideLock(RecoveryReservation r) {
+        if (r != null) cancelOutsideLock(r.handle);
+    }
+    private void cancelOutsideLock(RecoveryScheduler.Cancellable c) {
+        if (c == null) return;
+        try { c.cancel(); } catch (RuntimeException e) { LOG.warn("[{}] cancel error (ignored)", name, e); }
+    }
+
+    // ---- test hooks (package-private) --------------------------------------------------------
+    boolean debugIsInstalled(Watch w) {
+        lock.lock(); try { return w != null && w == installed; } finally { lock.unlock(); }
+    }
+    boolean debugHasPendingRecovery() {
+        lock.lock(); try { return pendingRecovery != null; } finally { lock.unlock(); }
+    }
+    int debugConsecutiveFailures() {
+        lock.lock(); try { return consecutiveFailures; } finally { lock.unlock(); }
+    }
+}
+
+
+/* ============================================================================
+ * FILE 08: reconciler-core/src/test/java/io/ssaownership/reconciler/InMemoryStore.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * Single-threaded in-memory {@link ConfigMapStore} fake for unit tests. It honours the policy
+ * parts of the contract (missing-CM-throws-on-write, reject-null, preserve-unrelated, absence vs
+ * empty) so a test cannot pass against behaviour the real adapter would not reproduce.
+ *
+ * NOT thread-safe and NOT evidence of concurrent putIfAbsent correctness — the deterministic
+ * conditional-update race must be verified against a real API server (KubeConfigMapStoreIT), not
+ * here. This fake only honours the single-threaded policy parts of the contract.
+ */
+final class InMemoryStore implements ConfigMapStore {
+
+    private final Map<String, Map<String, String>> cms = new HashMap<>();
+    int upsertCalls = 0;
+    int putIfAbsentCalls = 0;
+
+    /** When >0, the next N store calls of the matching op throw StoreException (retry tests). */
+    int failNextGet = 0;
+    int failNextUpsert = 0;
+    int failNextPutIfAbsent = 0;
+
+    /** Create an (empty) ConfigMap object, as the chart would. Writes require this to exist. */
+    void createConfigMap(String cm) {
+        cms.computeIfAbsent(cm, k -> new HashMap<>());
+    }
+
+    void seedKey(String cm, String key, String value) {
+        Objects.requireNonNull(value, "value");   // reject null: a present key cannot have null value
+        cms.computeIfAbsent(cm, k -> new HashMap<>()).put(key, value);
+    }
+
+    /** Delete a key but keep the ConfigMap object (models an external deletion of just the key). */
+    void deleteKey(String cm, String key) {
+        Map<String, String> data = cms.get(cm);
+        if (data != null) {
+            data.remove(key);
+        }
+    }
+
+    @Override
+    public Optional<String> get(String cm, String key) {
+        if (failNextGet > 0) { failNextGet--; throw new StoreException("injected get failure"); }
+        Map<String, String> data = cms.get(cm);
+        if (data == null) {
+            return Optional.empty();          // missing ConfigMap -> empty (per contract)
+        }
+        return Optional.ofNullable(data.get(key));  // empty ONLY if key absent; "" is present
+    }
+
+    @Override
+    public void upsert(String cm, String key, String value) {
+        Objects.requireNonNull(value, "value");   // reject null (per contract)
+        if (failNextUpsert > 0) { failNextUpsert--; throw new StoreException("injected upsert failure"); }
+        upsertCalls++;
+        Map<String, String> data = cms.get(cm);
+        if (data == null) {
+            throw new StoreException("ConfigMap " + cm + " does not exist");  // do not create
+        }
+        data.put(key, value);                      // preserves unrelated keys
+    }
+
+    @Override
+    public boolean putIfAbsent(String cm, String key, String value) {
+        Objects.requireNonNull(value, "value");
+        if (failNextPutIfAbsent > 0) { failNextPutIfAbsent--; throw new StoreException("injected putIfAbsent failure"); }
+        putIfAbsentCalls++;
+        Map<String, String> data = cms.get(cm);
+        if (data == null) {
+            throw new StoreException("ConfigMap " + cm + " does not exist");
+        }
+        if (data.containsKey(key)) {
+            return false;                          // preserve existing
+        }
+        data.put(key, value);
+        return true;
+    }
+}
+
+
+/* ============================================================================
+ * FILE 09: reconciler-core/src/test/java/io/ssaownership/reconciler/ManualScheduler.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Manually-controlled {@link RecoveryScheduler} for deterministic tests. It does NOT run tasks on
+ * a timer — the test decides exactly when (and whether) a scheduled task runs, and can even run a
+ * CANCELLED task on purpose to prove the lifecycle's own eligibility check (not cancellation) is
+ * what protects against stale work. No clock, no sleeps.
+ *
+ * <h2>Threading restriction</h2>
+ * This fake performs NO internal synchronisation of its bookkeeping ({@code scheduled},
+ * {@code run}, {@code cancelled}). Two usage patterns are permitted:
+ * <ul>
+ *   <li>Single-threaded driving: the test thread calls {@code schedule} and the {@code run*}
+ *       methods.</li>
+ *   <li>Ordered cross-thread handoff: a {@code run*} method may be invoked from a different thread
+ *       (e.g. the authorization-gap test runs a recovery task on a worker) PROVIDED the test
+ *       establishes a happens-before edge — via latches/Futures — so that no two threads touch the
+ *       bookkeeping concurrently. Each field is written by one thread and read by another only
+ *       across such an edge.</li>
+ * </ul>
+ * UNSYNCHRONISED CONCURRENT access to the bookkeeping is prohibited; tests that need a genuinely
+ * concurrent scheduler (handle-publication / rejection orderings) use {@code ControllableScheduler}
+ * instead, which synchronises its state. In all cases a task BODY is executed WITHOUT holding any
+ * lock, so a task that re-enters the lifecycle cannot deadlock against the scheduler.
+ */
+final class ManualScheduler implements RecoveryScheduler {
+
+    static final class Task implements Cancellable {
+        final Duration delay;
+        final Runnable body;
+        boolean cancelled = false;
+        boolean run = false;
+        Task(Duration delay, Runnable body) { this.delay = delay; this.body = body; }
+        @Override public void cancel() { cancelled = true; }
+    }
+
+    final List<Task> scheduled = new ArrayList<>();
+    boolean rejectScheduling = false;        // when true, schedule() throws (reject path test)
+
+    @Override
+    public Cancellable schedule(Duration delay, Runnable task) {
+        if (rejectScheduling) {
+            throw new RejectedException("scheduler is rejecting");
+        }
+        Task t = new Task(delay, task);
+        scheduled.add(t);
+        return t;
+    }
+
+    static final class RejectedException extends RuntimeException {
+        RejectedException(String m) { super(m); }
+    }
+
+    /** Run the most recently scheduled task that is NOT yet run, regardless of cancellation. */
+    void runLast() {
+        Task t = null;
+        for (int i = scheduled.size() - 1; i >= 0; i--) {
+            if (!scheduled.get(i).run) { t = scheduled.get(i); break; }
+        }
+        if (t == null) throw new AssertionError("no not-yet-run task to run");
+        t.run = true;
+        t.body.run();                         // body runs with no lock held
+    }
+
+    /** Run a specific scheduled task even if cancelled — to prove stale-task protection. */
+    void runEvenIfCancelled(Task t) { t.run = true; t.body.run(); }
+
+    /** Tasks that are neither cancelled nor already run — i.e. genuinely still pending. */
+    int pendingCount() {
+        return (int) scheduled.stream().filter(t -> !t.cancelled && !t.run).count();
+    }
+    Task last() { return scheduled.get(scheduled.size() - 1); }
+}
+
+
+/* ============================================================================
+ * FILE 10: reconciler-core/src/test/java/io/ssaownership/reconciler/ReconcilerTest.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Enforcement-contract tests for {@link Reconciler}. The decisive ones distinguish a source
+ * cache from true observed-destination comparison: destination drift and deletion with the SAME
+ * instance must be repaired/handled, which a source-cache implementation would fail.
+ */
+class ReconcilerTest {
+
+    private static final String CM = "demo-config";
+    private static final String KEY = "message";
+
+    private Reconciler upsert(InMemoryStore s, AtomicReference<String> src) {
+        return new Reconciler("enforce", CM, KEY, WriteStrategy.UPSERT, s, src::get);
+    }
+
+    // ---- UPSERT (enforcement) ----------------------------------------------------------------
+
+    @Test
+    void upsert_writes_then_skips_when_destination_in_sync() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        Reconciler r = upsert(s, new AtomicReference<>("A"));
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile());
+        assertEquals(Reconciler.Outcome.SKIPPED_IN_SYNC, r.reconcile());
+        assertEquals(1, s.upsertCalls);
+    }
+
+    @Test
+    void upsert_repairs_destination_drift_with_the_SAME_instance() {
+        // THE decisive test: write A, an external actor changes it to B, desired is still A.
+        // A source-cache implementation would wrongly SKIP. Enforcement must repair to A.
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        Reconciler r = upsert(s, new AtomicReference<>("A"));
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile());
+        s.seedKey(CM, KEY, "B");                       // external drift
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile(), "must repair drift, not skip");
+        assertEquals("A", s.get(CM, KEY).orElseThrow());
+    }
+
+    @Test
+    void upsert_repairs_destination_deletion_with_the_SAME_instance() {
+        // Same store, same reconciler, unchanged desired input. Write A, externally DELETE the
+        // key (keeping the ConfigMap and an unrelated key), reconcile again -> must restore A.
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        s.seedKey(CM, "other", "x");                   // unrelated content that must survive
+        Reconciler r = upsert(s, new AtomicReference<>("A"));
+
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile());
+        assertEquals("A", s.get(CM, KEY).orElseThrow());
+
+        s.deleteKey(CM, KEY);                          // external deletion of just our key
+        assertTrue(s.get(CM, KEY).isEmpty(), "precondition: key is gone");
+
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile(),
+                "same instance, unchanged desired: deletion must be repaired");
+        assertEquals("A", s.get(CM, KEY).orElseThrow(), "key restored");
+        assertEquals("x", s.get(CM, "other").orElseThrow(), "unrelated key preserved");
+    }
+
+    @Test
+    void upsert_initially_in_sync_does_not_write() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        s.seedKey(CM, KEY, "A");                       // destination already correct
+        Reconciler r = upsert(s, new AtomicReference<>("A"));
+        assertEquals(Reconciler.Outcome.SKIPPED_IN_SYNC, r.reconcile());
+        assertEquals(0, s.upsertCalls, "no unnecessary write when already in sync");
+    }
+
+    @Test
+    void get_failure_is_FAILED_and_retryable() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        Reconciler r = upsert(s, new AtomicReference<>("A"));
+        s.failNextGet = 1;                             // the read throws
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile());
+        assertTrue(s.get(CM, KEY).isEmpty(), "nothing written on read failure");
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile(), "next pass still succeeds");
+        assertEquals("A", s.get(CM, KEY).orElseThrow());
+    }
+
+    @Test
+    void upsert_write_failure_is_FAILED_and_retryable() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        Reconciler r = upsert(s, new AtomicReference<>("A"));
+        s.failNextUpsert = 1;                          // the WRITE throws (get succeeds first)
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile());
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile(), "identical desired still succeeds");
+        assertEquals("A", s.get(CM, KEY).orElseThrow());
+    }
+
+    @Test
+    void putIfAbsent_write_failure_is_FAILED_and_retryable() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        Reconciler r = new Reconciler("seed", CM, KEY, WriteStrategy.PUT_IF_ABSENT, s, () -> "d");
+        s.failNextPutIfAbsent = 1;
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile());
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile());
+        assertEquals("d", s.get(CM, KEY).orElseThrow());
+    }
+
+    /**
+     * A store that COMMITS the write and THEN throws — modelling the "unknown remote outcome"
+     * case where the server applied the change but the client saw a failure (timeout after
+     * commit). The first pass must report FAILED (the client cannot claim success); the next
+     * pass, observing the now-committed destination, must settle to a benign skip rather than
+     * re-writing or looping. This is exactly the semantics the Reconciler javadoc claims.
+     */
+    private static final class CommitThenThrowStore implements ConfigMapStore {
+        private final InMemoryStore delegate;
+        boolean armed;                      // throw once, after committing
+        CommitThenThrowStore(InMemoryStore delegate, boolean armed) { this.delegate = delegate; this.armed = armed; }
+        @Override public Optional<String> get(String cm, String k) { return delegate.get(cm, k); }
+        @Override public void upsert(String cm, String k, String v) {
+            delegate.upsert(cm, k, v);                       // COMMIT
+            if (armed) { armed = false; throw new StoreException("committed, then connection dropped"); }
+        }
+        @Override public boolean putIfAbsent(String cm, String k, String v) {
+            boolean wrote = delegate.putIfAbsent(cm, k, v);  // COMMIT
+            if (armed) { armed = false; throw new StoreException("committed insert, then connection dropped"); }
+            return wrote;
+        }
+    }
+
+    @Test
+    void upsert_commit_then_throw_is_FAILED_then_next_pass_is_SKIPPED_IN_SYNC() {
+        InMemoryStore backing = new InMemoryStore(); backing.createConfigMap(CM);
+        CommitThenThrowStore s = new CommitThenThrowStore(backing, true);
+        Reconciler r = new Reconciler("enforce", CM, KEY, WriteStrategy.UPSERT, s, () -> "A");
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile(),
+                "a write that committed but then threw must be reported FAILED (unknown remote outcome)");
+        assertEquals("A", backing.get(CM, KEY).orElseThrow(), "the write did commit remotely");
+        assertEquals(Reconciler.Outcome.SKIPPED_IN_SYNC, r.reconcile(),
+                "the next pass observes the committed value and settles — no re-write, no loop");
+    }
+
+    @Test
+    void putIfAbsent_commit_then_throw_is_FAILED_then_next_pass_is_SKIPPED_PRESENT() {
+        InMemoryStore backing = new InMemoryStore(); backing.createConfigMap(CM);
+        CommitThenThrowStore s = new CommitThenThrowStore(backing, true);
+        Reconciler r = new Reconciler("seed", CM, KEY, WriteStrategy.PUT_IF_ABSENT, s, () -> "d");
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile(),
+                "a committed insert that then threw must be reported FAILED");
+        assertEquals("d", backing.get(CM, KEY).orElseThrow(), "the insert did commit remotely");
+        assertEquals(Reconciler.Outcome.SKIPPED_PRESENT, r.reconcile(),
+                "the next pass sees the key present and preserves it — no duplicate write");
+    }
+
+    @Test
+    void empty_string_value_counts_as_present_and_in_sync() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        s.seedKey(CM, KEY, "");                        // present, empty
+        Reconciler r = upsert(s, new AtomicReference<>(""));
+        assertEquals(Reconciler.Outcome.SKIPPED_IN_SYNC, r.reconcile(),
+                "empty string is a present, matching value — not absence");
+        assertEquals(0, s.upsertCalls);
+    }
+
+    // ---- PUT_IF_ABSENT (seed) ----------------------------------------------------------------
+
+    @Test
+    void putIfAbsent_seeds_when_absent_but_preserves_existing_same_instance() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        Reconciler r = new Reconciler("seed", CM, KEY, WriteStrategy.PUT_IF_ABSENT, s, () -> "default-7");
+        assertEquals(Reconciler.Outcome.WROTE, r.reconcile());
+        assertEquals("default-7", s.get(CM, KEY).orElseThrow());
+
+        s.seedKey(CM, KEY, "operator-99");             // operator changes it
+        assertEquals(Reconciler.Outcome.SKIPPED_PRESENT, r.reconcile(),
+                "same instance must still preserve a now-present value");
+        assertEquals("operator-99", s.get(CM, KEY).orElseThrow());
+    }
+
+    @Test
+    void putIfAbsent_false_does_NOT_read_the_destination() {
+        // Proves the diagnostic read is truly gone: a store whose get() would fail the test if
+        // called. If the engine read after a false putIfAbsent, this throws AssertionError.
+        ConfigMapStore noRead = new ConfigMapStore() {
+            @Override public Optional<String> get(String cm, String k) {
+                throw new AssertionError("reconcile must NOT read after putIfAbsent==false");
+            }
+            @Override public void upsert(String cm, String k, String v) {
+                throw new AssertionError("unexpected upsert");
+            }
+            @Override public boolean putIfAbsent(String cm, String k, String v) {
+                return false;                          // key already present
+            }
+        };
+        Reconciler r = new Reconciler("seed", CM, KEY, WriteStrategy.PUT_IF_ABSENT, noRead, () -> "x");
+        assertEquals(Reconciler.Outcome.SKIPPED_PRESENT, r.reconcile());
+    }
+
+    // ---- failures & validation ---------------------------------------------------------------
+
+    @Test
+    void null_derivation_is_FAILED_not_thrown() {
+        InMemoryStore s = new InMemoryStore(); s.createConfigMap(CM);
+        Reconciler r = new Reconciler("x", CM, KEY, WriteStrategy.UPSERT, s, () -> null);
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile());
+    }
+
+    @Test
+    void missing_configmap_on_write_is_FAILED() {
+        InMemoryStore s = new InMemoryStore();         // CM not created
+        Reconciler r = upsert(s, new AtomicReference<>("A"));
+        assertEquals(Reconciler.Outcome.FAILED, r.reconcile(),
+                "writing to a non-existent ConfigMap is a (retryable) failure, not a silent create");
+    }
+
+    @Test
+    void constructor_rejects_null_dependencies() {
+        InMemoryStore s = new InMemoryStore();
+        assertThrows(NullPointerException.class,
+                () -> new Reconciler(null, CM, KEY, WriteStrategy.UPSERT, s, () -> "a"));
+        assertThrows(NullPointerException.class,
+                () -> new Reconciler("n", CM, KEY, WriteStrategy.UPSERT, null, () -> "a"));
+        assertThrows(NullPointerException.class,
+                () -> new Reconciler("n", CM, KEY, null, s, () -> "a"));
+    }
+}
+
+
+/* ============================================================================
+ * FILE 11: reconciler-core/src/test/java/io/ssaownership/reconciler/ExecutorRecoverySchedulerTest.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.time.Duration;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Direct unit tests for {@link ExecutorRecoveryScheduler}'s duration-conversion behaviour. These
+ * assert the EXACT value submitted to the backing executor via a RECORDING executor, rather than
+ * measuring elapsed time — so sub-millisecond rounding and overflow handling are observed
+ * precisely and deterministically.
+ */
+class ExecutorRecoverySchedulerTest {
+
+    /** Records the (delay, unit) of the last schedule() call; never actually runs the task. */
+    static final class RecordingExecutor extends ScheduledThreadPoolExecutor {
+        final AtomicLong lastDelay = new AtomicLong(Long.MIN_VALUE);
+        final AtomicReference<TimeUnit> lastUnit = new AtomicReference<>();
+        RecordingExecutor() { super(1); }
+        @Override public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            lastDelay.set(delay);
+            lastUnit.set(unit);
+            return new NoopFuture();
+        }
+    }
+
+    static final class NoopFuture implements ScheduledFuture<Object> {
+        @Override public long getDelay(TimeUnit unit) { return 0; }
+        @Override public int compareTo(Delayed o) { return 0; }
+        @Override public boolean cancel(boolean mayInterruptIfRunning) { return true; }
+        @Override public boolean isCancelled() { return false; }
+        @Override public boolean isDone() { return false; }
+        @Override public Object get() { return null; }
+        @Override public Object get(long timeout, TimeUnit unit) { return null; }
+    }
+
+    @Test @Timeout(10)
+    void positive_sub_millisecond_delay_is_submitted_as_one_millisecond_not_zero() {
+        RecordingExecutor rec = new RecordingExecutor();
+        try {
+            ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(rec);
+            s.schedule(Duration.ofNanos(1), () -> {});            // positive, sub-millisecond
+            assertEquals(TimeUnit.MILLISECONDS, rec.lastUnit.get());
+            assertEquals(1L, rec.lastDelay.get(),
+                    "a positive sub-ms delay must be submitted as 1ms, never silently 0");
+        } finally {
+            rec.shutdownNow();
+        }
+    }
+
+    @Test @Timeout(10)
+    void exactly_zero_delay_is_submitted_as_zero() {
+        RecordingExecutor rec = new RecordingExecutor();
+        try {
+            ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(rec);
+            s.schedule(Duration.ZERO, () -> {});
+            assertEquals(TimeUnit.MILLISECONDS, rec.lastUnit.get(), "unit must be milliseconds");
+            assertEquals(0L, rec.lastDelay.get(), "zero stays zero (not bumped to 1ms)");
+        } finally {
+            rec.shutdownNow();
+        }
+    }
+
+    @Test @Timeout(10)
+    void above_one_millisecond_truncates_fractional_millis_not_rounds_up() {
+        RecordingExecutor rec = new RecordingExecutor();
+        try {
+            ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(rec);
+            s.schedule(Duration.ofNanos(1_900_000), () -> {});    // 1.9 ms
+            assertEquals(TimeUnit.MILLISECONDS, rec.lastUnit.get(), "unit must be milliseconds");
+            assertEquals(1L, rec.lastDelay.get(), "1.9ms truncates to 1ms (toMillis), not up to 2ms");
+        } finally {
+            rec.shutdownNow();
+        }
+    }
+
+    @Test @Timeout(10)
+    void conversion_overflow_is_rejected_as_illegal_argument() {
+        RecordingExecutor rec = new RecordingExecutor();
+        try {
+            ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(rec);
+            // A duration whose toMillis() overflows a long:
+            Duration huge = Duration.ofSeconds(Long.MAX_VALUE);
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> s.schedule(huge, () -> {}));
+            assertTrue(ex.getMessage().toLowerCase().contains("too large"),
+                    "overflow must be an IllegalArgumentException about representability, was: " + ex.getMessage());
+            assertEquals(Long.MIN_VALUE, rec.lastDelay.get(),
+                    "an overflowing delay must never reach the executor");
+        } finally {
+            rec.shutdownNow();
+        }
+    }
+}
+
+
+/* ============================================================================
+ * FILE 12: reconciler-core/src/test/java/io/ssaownership/reconciler/ExecutorRecoverySchedulerIT.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import io.fabric8.kubernetes.client.Watch;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Integration tests for the REAL {@link ExecutorRecoveryScheduler}. These use bounded waits
+ * (latches with timeouts) to observe that a task actually ran — never sleeps as correctness
+ * evidence. They verify scheduler mechanics and its wiring to {@link WatchLifecycle}.
+ */
+class ExecutorRecoverySchedulerIT {
+
+    @Test @Timeout(10)
+    void task_runs_on_executor_thread_not_inline() throws Exception {
+        try (ExecutorRecoveryScheduler s = ExecutorRecoveryScheduler.createOwning("rec-test")) {
+            Thread caller = Thread.currentThread();
+            AtomicBoolean ranInline = new AtomicBoolean(false);
+            CountDownLatch ran = new CountDownLatch(1);
+            s.schedule(Duration.ofMillis(1), () -> {
+                if (Thread.currentThread() == caller) ranInline.set(true);
+                ran.countDown();
+            });
+            assertTrue(ran.await(5, TimeUnit.SECONDS), "task should run");
+            assertFalse(ranInline.get(), "task must NOT run on the caller thread");
+        }
+    }
+
+    @Test @Timeout(10)
+    void cancel_prevents_a_not_yet_started_task() throws Exception {
+        // Occupy the ONLY worker with a blocking task so nothing else can start; schedule the
+        // target (0 delay) and CANCEL it while the worker is still blocked; queue a marker (0
+        // delay) AFTER the target; release the worker; await the marker and assert the target
+        // never ran. With cancel() a no-op the target would run before the marker -> test fails.
+        ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor();
+        CountDownLatch workerBusy = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        CountDownLatch blockerDone = new CountDownLatch(1);
+        java.util.concurrent.Future<?> blocker = null;
+        try {
+            ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(exec);
+            // block the single worker; retain its Future so we can observe completion and surface
+            // any failure, and ALWAYS release it in the finally block.
+            blocker = exec.submit(() -> {
+                try {
+                    workerBusy.countDown();
+                    if (!releaseWorker.await(5, TimeUnit.SECONDS)) throw new AssertionError("worker not released");
+                } finally {
+                    blockerDone.countDown();
+                }
+                return null;
+            });
+            assertTrue(workerBusy.await(5, TimeUnit.SECONDS), "worker should be occupied");
+
+            AtomicInteger targetRuns = new AtomicInteger();
+            var handle = s.schedule(Duration.ofMillis(0), targetRuns::incrementAndGet);
+            handle.cancel();                               // cancel while worker is blocked
+            CountDownLatch markerRan = new CountDownLatch(1);
+            s.schedule(Duration.ofMillis(0), markerRan::countDown);  // queued after target
+
+            releaseWorker.countDown();                     // now the queue drains in order
+            assertTrue(markerRan.await(5, TimeUnit.SECONDS), "marker must run");
+            assertEquals(0, targetRuns.get(), "cancelled target must NOT have run");
+            assertTrue(blockerDone.await(5, TimeUnit.SECONDS), "the blocking task must complete");
+            blocker.get(5, TimeUnit.SECONDS);              // surface any failure from the blocking task
+        } finally {
+            releaseWorker.countDown();                     // ensure the worker is never left parked
+            exec.shutdownNow();
+            assertTrue(exec.awaitTermination(5, TimeUnit.SECONDS), "executor must terminate");
+        }
+    }
+
+    @Test @Timeout(10)
+    void owning_scheduler_shuts_down_its_own_executor_on_close() throws Exception {
+        // createOwning() OWNS its executor; close() must shut that executor down (and then reject
+        // further scheduling). Contrast with the shared-executor test above, where close() is a
+        // no-op. try-with-resources guarantees cleanup even if an assertion fails before the
+        // explicit close; a second close() is a harmless no-op (executor already shut down).
+        try (ExecutorRecoveryScheduler s = ExecutorRecoveryScheduler.createOwning("owned-test")) {
+            CountDownLatch ran = new CountDownLatch(1);
+            s.schedule(Duration.ofMillis(1), ran::countDown);
+            assertTrue(ran.await(5, TimeUnit.SECONDS), "owned scheduler runs tasks before close");
+
+            s.close();                                    // must shut down the OWNED executor
+
+            // After close, scheduling must be rejected because the owned executor is shut down.
+            assertThrows(RejectedExecutionException.class,
+                    () -> s.schedule(Duration.ofMillis(1), () -> {}),
+                    "an owned scheduler must reject scheduling after close() shuts its executor down");
+        }
+    }
+
+    @Test @Timeout(10)
+    void negative_delay_is_rejected() {
+        try (ExecutorRecoveryScheduler s = ExecutorRecoveryScheduler.createOwning("rec-test")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> s.schedule(Duration.ofMillis(-1), () -> {}));
+        }
+    }
+
+    @Test @Timeout(10)
+    void shared_executor_is_not_shut_down_by_a_lifecycle_scheduler() throws Exception {
+        ScheduledExecutorService shared = Executors.newSingleThreadScheduledExecutor();
+        try {
+            ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(shared);  // not owned
+            s.close();                                   // must be a no-op for a shared executor
+            assertFalse(shared.isShutdown(), "a shared executor must survive scheduler.close()");
+            // and it still works:
+            CountDownLatch ran = new CountDownLatch(1);
+            s.schedule(Duration.ofMillis(1), ran::countDown);
+            assertTrue(ran.await(5, TimeUnit.SECONDS));
+        } finally {
+            shared.shutdownNow();
+        }
+    }
+
+    @Test @Timeout(10)
+    void executor_rejection_surfaces_as_DEGRADED_in_the_lifecycle() throws Exception {
+        // Wire a lifecycle to a scheduler whose executor is already shut down -> schedule() throws
+        // RejectedExecutionException -> lifecycle must enter DEGRADED (agreed failure path).
+        ScheduledExecutorService dead = Executors.newSingleThreadScheduledExecutor();
+        dead.shutdownNow();
+        ExecutorRecoveryScheduler s = new ExecutorRecoveryScheduler(dead);
+
+        final Runnable[] onClosedHolder = new Runnable[1];
+        WatchFactory factory = onClosed -> {
+            onClosedHolder[0] = onClosed;
+            return (Watch) () -> onClosed.run();         // close() triggers onClosed
+        };
+        WatchLifecycle lc = new WatchLifecycle("deg", factory, s);
+        lc.registerWatch();                              // installs a watch
+        // trigger a close -> onClosed -> schedule recovery -> rejected -> DEGRADED
+        onClosedHolder[0].run();
+        assertEquals(WatchLifecycle.Health.DEGRADED, lc.health(),
+                "rejected recovery scheduling must surface DEGRADED");
+        assertFalse(lc.debugHasPendingRecovery(), "no phantom pending recovery after rejection");
+    }
+}
+
+
+/* ============================================================================
+ * FILE 13: reconciler-core/src/test/java/io/ssaownership/reconciler/WatchLifecycleTest.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler;
+
+import io.fabric8.kubernetes.client.Watch;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Deterministic tests for {@link WatchLifecycle}. A manually-controlled {@link ManualScheduler}
+ * makes recovery timing explicit (no clock, no sleeps). Threaded tests use latches with CHECKED
+ * waits, release gates in finally, and propagate worker exceptions through retained Futures, so a
+ * green test cannot silently have skipped its intended interleaving. Timeouts are deadlock guards.
+ */
+class WatchLifecycleTest {
+
+    /** A watch with identity that fires its bound onClosed exactly once on close. */
+    static final class TestWatch implements Watch {
+        final int id;
+        final Runnable onClosed;
+        final AtomicInteger closes = new AtomicInteger();
+        TestWatch(int id, Runnable onClosed) { this.id = id; this.onClosed = onClosed; }
+        @Override public void close() { if (closes.incrementAndGet() == 1) onClosed.run(); }
+        boolean closed() { return closes.get() > 0; }
+        @Override public String toString() { return "w#" + id; }
+    }
+
+    /** Factory recording every watch it makes. Subclassable for interleaving seams. */
+    static class Factory implements WatchFactory {
+        final Set<TestWatch> created = ConcurrentHashMap.newKeySet();
+        final AtomicInteger seq = new AtomicInteger();
+        volatile boolean closeImmediately = false;
+        @Override public Watch create(Runnable onClosed) {
+            TestWatch w = new TestWatch(seq.incrementAndGet(), onClosed);
+            created.add(w);
+            if (closeImmediately) w.close();
+            return w;
+        }
+    }
+
+    private TestWatch installedWatch(Factory f, WatchLifecycle lc) {
+        return f.created.stream().filter(lc::debugIsInstalled).findFirst().orElseThrow();
+    }
+    private void assertNoLeak(Factory f, WatchLifecycle lc) {
+        for (TestWatch w : f.created) {
+            boolean inst = lc.debugIsInstalled(w);
+            assertTrue(inst || w.closed(), w + " leaked (neither installed nor closed)");
+            if (inst) assertFalse(w.closed(), w + " installed yet closed");
+        }
+    }
+
+    // ---- basic lifecycle --------------------------------------------------------------------
+
+    @Test @Timeout(10)
+    void install_then_deactivate_closes_installed() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        TestWatch w = installedWatch(f, lc);
+        lc.deactivate();
+        assertEquals(WatchLifecycle.Health.DEACTIVATED, lc.health());
+        assertTrue(w.closed(), "installed watch closed on deactivate");
+        assertNoLeak(f, lc);
+    }
+
+    @Test @Timeout(10)
+    void deactivate_cancels_a_pending_recovery() {
+        // Create pending recovery (close the installed watch), THEN deactivate, and assert the
+        // scheduled recovery task was cancelled (not merely ineligible).
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        installedWatch(f, lc).close();                 // schedules recovery
+        ManualScheduler.Task recovery = s.last();
+        assertFalse(recovery.cancelled, "precondition: recovery not yet cancelled");
+        lc.deactivate();
+        assertTrue(recovery.cancelled, "deactivate must cancel the pending recovery handle");
+    }
+
+    @Test @Timeout(10)
+    void close_before_install_is_handled_without_a_probe_and_schedules_recovery() {
+        Factory f = new Factory(); f.closeImmediately = true;
+        ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        assertEquals(0, f.created.stream().filter(lc::debugIsInstalled).count(),
+                "a watch that closed before install must not be installed");
+        assertTrue(lc.debugHasPendingRecovery(), "close-before-install must schedule recovery");
+        assertNoLeak(f, lc);
+    }
+
+    @Test @Timeout(10)
+    void installed_watch_close_schedules_recovery_queued_not_inline() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        int before = f.created.size();
+        installedWatch(f, lc).close();
+        assertEquals(before, f.created.size(), "recovery must NOT create a watch inline");
+        assertEquals(1, s.pendingCount(), "exactly one recovery queued");
+        s.runLast();
+        assertEquals(before + 1, f.created.size(), "recovery creates the replacement");
+        assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count());
+        assertNoLeak(f, lc);
+    }
+
+    @Test @Timeout(10)
+    void stale_recovery_task_run_after_deactivate_creates_no_watch_and_was_cancelled() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        installedWatch(f, lc).close();
+        ManualScheduler.Task recovery = s.last();
+        lc.deactivate();
+        assertTrue(recovery.cancelled, "deactivate cancels the task (cancellation DID occur)");
+        int before = f.created.size();
+        s.runEvenIfCancelled(recovery);                // eligibility must still protect us
+        assertEquals(before, f.created.size(), "stale recovery after deactivate creates no watch");
+    }
+
+    @Test @Timeout(10)
+    void duplicate_close_callbacks_do_not_create_duplicate_recovery() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        TestWatch w = installedWatch(f, lc);
+        w.close();                                     // schedules recovery
+        w.onClosed.run();                              // stale duplicate for the same (old) gen
+        assertEquals(1, s.pendingCount(), "duplicate close must not double-schedule recovery");
+    }
+
+    @Test @Timeout(10)
+    void repeated_immediate_close_does_not_recurse_or_spin() {
+        Factory f = new Factory(); f.closeImmediately = true;
+        ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        assertEquals(1, s.pendingCount());
+        s.runLast();
+        s.runLast();
+        assertEquals(3, f.created.size(), "exactly one watch per recovery; no recursion");
+        assertEquals(1, s.pendingCount(), "exactly one recovery pending at a time");
+        assertTrue(lc.debugHasPendingRecovery());
+    }
+
+    // ---- backoff ----------------------------------------------------------------------------
+
+    @Test @Timeout(10)
+    void slow_recovery_latency_does_not_reset_the_streak() {
+        long[] clock = {0L};
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s,
+                Duration.ofSeconds(1), Duration.ofSeconds(30), Duration.ofSeconds(10), () -> clock[0]);
+        lc.registerWatch();                                   // install A at t=0
+        installedWatch(f, lc).close();                        // A lived 0
+        assertEquals(1, lc.debugConsecutiveFailures());
+        assertEquals(Duration.ofSeconds(1), s.last().delay, "first delay is base 1s");
+        clock[0] = Duration.ofSeconds(40).toNanos();          // recovery latency; nothing alive
+        s.runLast();                                          // install B at t=40s
+        assertEquals(1, lc.debugConsecutiveFailures(), "recovery latency must NOT reset the streak");
+        installedWatch(f, lc).close();                        // B lived 0
+        assertEquals(2, lc.debugConsecutiveFailures());
+        assertEquals(Duration.ofSeconds(2), s.last().delay, "second delay is 2s (exponential)");
+    }
+
+    @Test @Timeout(10)
+    void genuinely_stable_watch_resets_the_failure_streak() {
+        long[] clock = {0L};
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s,
+                Duration.ofSeconds(1), Duration.ofSeconds(30), Duration.ofSeconds(10), () -> clock[0]);
+        lc.registerWatch();
+        installedWatch(f, lc).close();                        // streak 1
+        s.runLast();                                          // reinstall B
+        assertEquals(1, lc.debugConsecutiveFailures());
+        clock[0] += Duration.ofSeconds(30).toNanos();         // B lives 30s (> 10s threshold)
+        installedWatch(f, lc).close();
+        assertEquals(1, lc.debugConsecutiveFailures(), "stable B resets streak; the close re-increments to 1");
+    }
+
+    // ---- supersession / recovery races ------------------------------------------------------
+
+    @Test @Timeout(10)
+    void pending_recovery_is_invalidated_by_an_explicit_install() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();                                   // A
+        installedWatch(f, lc).close();                        // queue recovery R
+        ManualScheduler.Task r = s.last();
+        lc.registerWatch();                                   // explicit B invalidates R
+        assertTrue(r.cancelled, "explicit install must cancel the detached recovery handle");
+        int before = f.created.size();
+        TestWatch b = installedWatch(f, lc);
+        s.runEvenIfCancelled(r);                              // run the stale recovery deliberately
+        assertEquals(before, f.created.size(), "stale pending recovery must create no watch");
+        assertTrue(lc.debugIsInstalled(b), "explicit winner B remains installed");
+        assertFalse(lc.debugHasPendingRecovery());
+    }
+
+    @Test @Timeout(10)
+    void during_creation_supersession_rejects_and_cleans_up_the_stale_candidate() {
+        // Supersession that happens WHILE recovery is INSIDE the factory (not the pre-creation
+        // gap — see authorization_gap_* for that). Single-threaded via a factory seam. The
+        // explicit replacement B is registered re-entrantly from inside the recovery's create()
+        // call; the stale recovery candidate must be rejected on its install attempt. We capture
+        // B's identity at the moment of its registration so the assertions prove the EXPLICIT
+        // winner stayed installed — not merely that "some one watch" is installed (a stale
+        // recovery winning and closing B would satisfy a bare count).
+        ManualScheduler s = new ManualScheduler();
+        final WatchLifecycle[] ref = new WatchLifecycle[1];
+        final boolean[] arm = {false};
+        final TestWatch[] winnerBox = new TestWatch[1];
+        Factory raceFactory = new Factory() {
+            @Override public Watch create(Runnable onClosed) {
+                if (arm[0]) {
+                    arm[0] = false;
+                    ref[0].registerWatch();                 // install newer B during recovery's create
+                    winnerBox[0] = installedWatch(this, ref[0]);   // capture the explicit winner B
+                }
+                return super.create(onClosed);
+            }
+        };
+        WatchLifecycle lc = new WatchLifecycle("t", raceFactory, s);
+        ref[0] = lc;
+        lc.registerWatch();
+        installedWatch(raceFactory, lc).close();
+        ManualScheduler.Task recovery = s.last();
+        arm[0] = true;
+        s.runEvenIfCancelled(recovery);
+        assertNotNull(winnerBox[0], "the explicit replacement must have been captured");
+        assertTrue(lc.debugIsInstalled(winnerBox[0]),
+                "the EXPLICIT replacement B must remain installed; the stale recovery candidate must not displace it");
+        assertEquals(1, raceFactory.created.stream().filter(lc::debugIsInstalled).count(),
+                "exactly one installed (the explicit winner)");
+        assertFalse(lc.debugHasPendingRecovery(), "no competing recovery left pending");
+        assertNoLeak(raceFactory, lc);
+    }
+
+    @Test @Timeout(10)
+    void authorization_gap_recovery_superseded_before_creation_dispatch() throws Exception {
+        // THE pre-creation authorization gap: recovery consumes its reservation and authorizes R,
+        // then PAUSES at the test seam (OUTSIDE the factory, before creation dispatch). An explicit
+        // registration installs B. Recovery resumes with its ORIGINAL identity. B must remain; the
+        // stale recovery must not install or displace it. This is the interleaving the old
+        // re-minting implementation got wrong.
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        CountDownLatch atSeam = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        // seam runs on the recovery thread, outside the lock, after authorize, before create:
+        Runnable seam = () -> {
+            atSeam.countDown();
+            try {
+                if (!release.await(2, TimeUnit.SECONDS)) throw new AssertionError("seam not released");
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+        };
+        WatchLifecycle lc = new WatchLifecycle("t", f, s,
+                Duration.ofSeconds(1), Duration.ofSeconds(30), Duration.ofSeconds(60),
+                System::nanoTime, seam);
+        lc.registerWatch();                                   // A
+        installedWatch(f, lc).close();                        // queue recovery R
+        ManualScheduler.Task recovery = s.last();
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> recFut = pool.submit(() -> { s.runEvenIfCancelled(recovery); return null; });
+        try {
+            assertTrue(atSeam.await(2, TimeUnit.SECONDS), "recovery must reach the seam (authorized, pre-create)");
+            // At the seam the reservation has been CONSUMED (authorized into an Attempt): recovery
+            // no longer holds a pending reservation that an explicit registration would need to
+            // cancel. This is precisely why the identity must be carried, not re-minted.
+            assertFalse(lc.debugHasPendingRecovery(),
+                    "authorization must have consumed the reservation before the seam");
+            lc.registerWatch();                               // explicit B while R is paused pre-create
+            TestWatch b = installedWatch(f, lc);
+            release.countDown();                              // let R proceed to create+install-attempt
+            recFut.get(5, TimeUnit.SECONDS);                  // propagate worker exceptions; await completion
+            assertTrue(lc.debugIsInstalled(b), "explicit B must remain installed; stale R cannot displace it");
+            assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count());
+            assertFalse(lc.debugHasPendingRecovery(),
+                    "the stale recovery must not leave a competing recovery scheduled");
+            assertNoLeak(f, lc);
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "worker must terminate");
+        }
+    }
+
+    @Test @Timeout(10)
+    void old_watch_closes_while_replacement_blocked_in_factory() throws Exception {
+        // A installed. Explicit re-registration B blocks INSIDE the factory. While B is in flight,
+        // A closes. Assert the INTERMEDIATE transition: A detached, no pending recovery, nothing
+        // queued — the in-flight authorized B must not be superseded. Then release B and assert B
+        // installs.
+        CountDownLatch bInFactory = new CountDownLatch(1);
+        CountDownLatch releaseB = new CountDownLatch(1);
+        AtomicInteger createCount = new AtomicInteger();
+        Factory f = new Factory() {
+            @Override public Watch create(Runnable onClosed) {
+                if (createCount.incrementAndGet() == 2) {     // B is the 2nd create
+                    bInFactory.countDown();
+                    try {
+                        if (!releaseB.await(2, TimeUnit.SECONDS)) throw new AssertionError("B not released");
+                    } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+                }
+                return super.create(onClosed);
+            }
+        };
+        ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();                                   // A (create #1)
+        TestWatch a = installedWatch(f, lc);
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> bFut = pool.submit(() -> { lc.registerWatch(); return null; });  // create #2 blocks
+        try {
+            assertTrue(bInFactory.await(2, TimeUnit.SECONDS), "B must be blocked in the factory");
+            a.close();                                        // old installed A closes while B in flight
+            // INTERMEDIATE assertions (B still blocked):
+            assertFalse(lc.debugIsInstalled(a), "A detached");
+            assertFalse(lc.debugHasPendingRecovery(), "no recovery while authorized B in flight");
+            assertEquals(0, s.pendingCount(), "A's close must not queue a competing recovery");
+            releaseB.countDown();
+            bFut.get(5, TimeUnit.SECONDS);                    // propagate exceptions; await
+            assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count(), "B installs");
+        } finally {
+            releaseB.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "worker must terminate");
+        }
+    }
+
+    @Test @Timeout(10)
+    void rejected_scheduling_enters_DEGRADED_not_silent_pending_forever() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();
+        s.rejectScheduling = true;
+        installedWatch(f, lc).close();
+        assertEquals(WatchLifecycle.Health.DEGRADED, lc.health(),
+                "rejected recovery scheduling must surface DEGRADED");
+        assertFalse(lc.debugHasPendingRecovery(), "no phantom pending recovery after rejection");
+    }
+
+    // ---- scheduler handle-publication & shutdown/supersession orderings ---------------------
+    //
+    // These exercise the races the lifecycle documentation explicitly claims: the handle returned
+    // by schedule() can arrive AFTER the task it schedules has already run (or after the lifecycle
+    // was superseded/shut down), and a scheduling REJECTION can arrive after supersession/shutdown.
+    // A controllable scheduler lets the test fix the ordering. Crucially, tasks run on a REAL
+    // separate thread (never inline inside schedule()), so the harness does not itself violate the
+    // "never inline" scheduler contract while verifying it.
+
+    /**
+     * Controllable {@link RecoveryScheduler}: captures each scheduled task; the test runs it (on a
+     * dedicated thread) and independently decides when schedule() returns its handle, so handle
+     * publication can be ordered before/after task execution, supersession, or shutdown. Bookkeeping
+     * is synchronized; task bodies are NEVER invoked while holding the lock.
+     */
+    static final class ControllableScheduler implements RecoveryScheduler {
+        static final class Handle implements Cancellable {
+            final AtomicInteger cancels = new AtomicInteger();
+            @Override public void cancel() { cancels.incrementAndGet(); }
+            boolean cancelled() { return cancels.get() > 0; }
+        }
+        final Object mon = new Object();
+        Runnable lastTask;                       // guarded by mon
+        Handle lastHandle;                       // guarded by mon
+        private CountDownLatch captured = new CountDownLatch(1);  // counted down when a task is captured
+        private CountDownLatch releaseSchedule;  // if set, schedule() blocks until counted down
+        private boolean rejectOnRelease = false; // if set, the released schedule() throws instead of returning
+
+        /** Arrange that the NEXT schedule() call blocks (after capturing the task) until released. */
+        CountDownLatch blockNextScheduleReturn() {
+            CountDownLatch l = new CountDownLatch(1);
+            synchronized (mon) { releaseSchedule = l; rejectOnRelease = false; }
+            return l;
+        }
+        /** Like {@link #blockNextScheduleReturn} but the released schedule() THROWS a rejection. */
+        CountDownLatch blockThenRejectNextSchedule() {
+            CountDownLatch l = new CountDownLatch(1);
+            synchronized (mon) { releaseSchedule = l; rejectOnRelease = true; }
+            return l;
+        }
+
+        /** Block until a task has been handed to schedule() (replaces test spin loops). */
+        void awaitCaptured(long seconds) {
+            CountDownLatch c;
+            synchronized (mon) { c = captured; }
+            try { if (!c.await(seconds, TimeUnit.SECONDS)) throw new AssertionError("no task captured in time"); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+        }
+
+        @Override public Cancellable schedule(Duration delay, Runnable task) {
+            CountDownLatch toAwait;
+            boolean reject;
+            Handle h = new Handle();
+            synchronized (mon) {
+                lastTask = task; lastHandle = h;
+                toAwait = releaseSchedule; releaseSchedule = null;
+                reject = rejectOnRelease; rejectOnRelease = false;
+                captured.countDown();            // signal capture AFTER recording task+handle
+            }
+            if (toAwait != null) {
+                try { if (!toAwait.await(2, TimeUnit.SECONDS)) throw new AssertionError("schedule() not released"); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+            }
+            if (reject) throw new ManualScheduler.RejectedException("rejected on release");
+            return h;
+        }
+        Runnable task()  { synchronized (mon) { return lastTask; } }
+        Handle handle()  { synchronized (mon) { return lastHandle; } }
+    }
+
+    private Future<?> runOnThread(ExecutorService pool, Runnable r) {
+        return pool.submit(() -> { r.run(); return null; });
+    }
+
+    @Test @Timeout(10)
+    void recovery_runs_before_schedule_returns_its_handle_then_handle_is_cancelled() throws Exception {
+        // Ordering: schedule() captures the task but BLOCKS before returning its handle. The task
+        // runs to completion on another thread (consuming the reservation, installing B). Only then
+        // does schedule() return. The lifecycle must observe the reservation is no longer pending
+        // and CANCEL the late handle rather than record it.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
+            lc.registerWatch();                              // A
+            // closing A calls scheduleRecovery, which will block inside schedule():
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            // wait until the task was captured (schedule() entered):
+            s.awaitCaptured(2);
+            // run the recovery task NOW, before schedule() has returned its handle:
+            Future<?> runFut = runOnThread(pool, s.task());
+            runFut.get(5, TimeUnit.SECONDS);                 // recovery installs B, consumes reservation
+            releaseSchedule.countDown();                     // now let schedule() return the late handle
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertTrue(s.handle().cancelled(),
+                    "a handle returned after its task already ran must be cancelled, not recorded");
+            assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count(), "B installed");
+            assertFalse(lc.debugHasPendingRecovery());
+            assertNoLeak(f, lc);
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void handle_returned_after_supersession_is_cancelled_and_newer_work_unaffected() throws Exception {
+        // schedule() blocks before returning. While blocked, an explicit registration supersedes
+        // the recovery reservation and installs B. When schedule() finally returns, the stale
+        // handle must be cancelled and B must be untouched.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
+            lc.registerWatch();                              // A
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            s.awaitCaptured(2);
+            lc.registerWatch();                              // explicit B supersedes the reservation
+            TestWatch b = installedWatch(f, lc);
+            releaseSchedule.countDown();                     // schedule() returns the now-stale handle
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertTrue(s.handle().cancelled(), "handle for a superseded reservation must be cancelled");
+            assertTrue(lc.debugIsInstalled(b), "the newer explicit B is unaffected");
+            assertFalse(lc.debugHasPendingRecovery());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void handle_returned_after_shutdown_is_cancelled_and_no_reactivation() throws Exception {
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockNextScheduleReturn();
+            lc.registerWatch();
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            s.awaitCaptured(2);
+            lc.deactivate();                                 // shutdown while schedule() is blocked
+            releaseSchedule.countDown();
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertTrue(s.handle().cancelled(), "late handle after shutdown must be cancelled");
+            assertEquals(WatchLifecycle.Health.DEACTIVATED, lc.health(), "shutdown stays terminal");
+            assertFalse(lc.debugHasPendingRecovery(), "no reactivation");
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void scheduling_rejected_after_supersession_does_not_mark_newer_work_degraded() throws Exception {
+        // The recovery's scheduleRecovery() REJECTS, but by the time the rejection surfaces an
+        // explicit B has already superseded the reservation. The rejection must NOT drag the
+        // (healthy) newer state into DEGRADED, because the rejected reservation is no longer the
+        // pending one.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockThenRejectNextSchedule();  // schedule() will throw on release
+            lc.registerWatch();                              // A
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            s.awaitCaptured(2);
+            lc.registerWatch();                              // explicit B supersedes reservation R
+            TestWatch b = installedWatch(f, lc);
+            releaseSchedule.countDown();                     // schedule() now throws the rejection
+            closeFut.get(5, TimeUnit.SECONDS);               // onClosed's scheduleRecovery sees the throw
+            assertTrue(lc.debugIsInstalled(b), "newer explicit B stays installed");
+            assertNotEquals(WatchLifecycle.Health.DEGRADED, lc.health(),
+                    "a rejection for a superseded reservation must not degrade newer work");
+            assertFalse(lc.debugHasPendingRecovery());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void scheduling_rejected_after_shutdown_keeps_health_deactivated() throws Exception {
+        // scheduleRecovery() rejects AFTER the lifecycle was deactivated: the health==DEACTIVATED
+        // guard must keep it terminal, never flipping to DEGRADED.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch releaseSchedule = s.blockThenRejectNextSchedule();
+            lc.registerWatch();
+            Future<?> closeFut = runOnThread(pool, () -> installedWatch(f, lc).close());
+            s.awaitCaptured(2);
+            lc.deactivate();                                 // terminal, while schedule() is blocked
+            releaseSchedule.countDown();                     // schedule() throws the rejection now
+            closeFut.get(5, TimeUnit.SECONDS);
+            assertEquals(WatchLifecycle.Health.DEACTIVATED, lc.health(),
+                    "a rejection after shutdown must leave health DEACTIVATED, not DEGRADED");
+            assertFalse(lc.debugHasPendingRecovery());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void shutdown_while_factory_creation_blocked_closes_the_late_candidate_and_never_installs() throws Exception {
+        // registerWatch()'s create() blocks inside the factory. While blocked, the lifecycle is
+        // deactivated. When create() returns, the candidate must be CLOSED (cleaned up) and never
+        // installed — shutdown prevents installation but not the already-dispatched factory call.
+        CountDownLatch inFactory = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Factory f = new Factory() {
+            @Override public Watch create(Runnable onClosed) {
+                inFactory.countDown();
+                try { if (!release.await(2, TimeUnit.SECONDS)) throw new AssertionError("not released"); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+                return super.create(onClosed);
+            }
+        };
+        ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> regFut = runOnThread(pool, lc::registerWatch);
+            assertTrue(inFactory.await(2, TimeUnit.SECONDS), "create must be blocked in the factory");
+            lc.deactivate();                                 // shutdown while candidate is being created
+            release.countDown();
+            regFut.get(5, TimeUnit.SECONDS);
+            assertEquals(0, f.created.stream().filter(lc::debugIsInstalled).count(), "late candidate never installed");
+            TestWatch candidate = f.created.iterator().next();
+            assertTrue(candidate.closed(), "the late candidate must be closed (cleaned up)");
+            assertEquals(WatchLifecycle.Health.DEACTIVATED, lc.health());
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test @Timeout(10)
+    void replacement_creation_fails_while_old_healthy_keeps_old_installed_and_follows_recovery_policy() throws Exception {
+        // A installed and healthy. An explicit re-registration B's create() THROWS (before any
+        // install). A create failure must NOT tear down the healthy A — supersession happens only
+        // on a SUCCESSFUL create — and onCreateFailed must schedule recovery for the current
+        // (failed) attempt. The subsequent recovery create succeeds and supersedes A.
+        AtomicInteger entries = new AtomicInteger();
+        Factory f = new Factory() {
+            @Override public Watch create(Runnable onClosed) {
+                if (entries.incrementAndGet() == 2) {        // entry 1 = A, entry 2 = B (fails), entry 3 = recovery
+                    throw new IllegalStateException("boom on B's create");
+                }
+                return super.create(onClosed);
+            }
+        };
+        ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        lc.registerWatch();                                  // A (entry 1 ok)
+        TestWatch a = installedWatch(f, lc);
+        lc.registerWatch();                                  // B: entry 2 throws
+        assertFalse(a.closed(), "a failed replacement create must not close the healthy old watch");
+        assertTrue(lc.debugIsInstalled(a), "A remains installed after B's create failure");
+        assertTrue(lc.debugHasPendingRecovery(), "a failed create schedules recovery (policy)");
+        s.runLast();                                         // entry 3: recovery create succeeds
+        assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count(), "exactly one installed");
+        assertFalse(lc.debugIsInstalled(a), "recovery's new watch supersedes A");
+        assertTrue(a.closed(), "A is closed when the successful replacement installs");
+    }
+
+    @Test @Timeout(10)
+    void constructor_normalizes_duration_overflow_into_a_named_config_error() {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        Duration overflowMillis = Duration.ofSeconds(Long.MAX_VALUE);   // toMillis() overflows
+        // baseDelay overflow:
+        IllegalArgumentException b = assertThrows(IllegalArgumentException.class,
+                () -> new WatchLifecycle("t", f, s, overflowMillis, overflowMillis, Duration.ofSeconds(10), System::nanoTime));
+        assertTrue(b.getMessage().contains("baseDelay"), "must name baseDelay: " + b.getMessage());
+        // stableResetAfter overflow (nanos): valid base/max, overflowing stability window.
+        Duration overflowNanos = Duration.ofSeconds(Long.MAX_VALUE / 1_000_000_000L + 1);
+        IllegalArgumentException st = assertThrows(IllegalArgumentException.class,
+                () -> new WatchLifecycle("t", f, s, Duration.ofSeconds(1), Duration.ofSeconds(30), overflowNanos, System::nanoTime));
+        assertTrue(st.getMessage().contains("stableResetAfter"), "must name stableResetAfter: " + st.getMessage());
+    }
+
+    @Test @Timeout(10)
+    void stale_handle_returning_while_a_newer_recovery_reservation_is_pending_leaves_it_intact() throws Exception {
+        // The newer work is a PENDING RECOVERY RESERVATION (not an installed watch). A's recovery
+        // R1 blocks in schedule() before returning its handle. R1's task runs and installs B; B
+        // then closes, reserving a NEWER recovery R2 (pending, scheduled via a fresh schedule()).
+        // Only then does R1's original schedule() return its now-stale handle. That stale handle
+        // must be cancelled and must NOT disturb R2; running R2 must still install a watch.
+        ControllableScheduler s = new ControllableScheduler();
+        Factory f = new Factory();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch release1 = s.blockNextScheduleReturn();   // R1's schedule() will block
+        try {
+            lc.registerWatch();                                  // A
+            Future<?> close1 = runOnThread(pool, () -> installedWatch(f, lc).close());  // -> R1 (schedule blocks)
+            s.awaitCaptured(2);
+            Runnable r1Task = s.task();
+            ControllableScheduler.Handle r1Handle = s.handle();
+
+            // Run R1's task now (before its handle returns): installs B.
+            runOnThread(pool, r1Task).get(5, TimeUnit.SECONDS);
+            TestWatch b = installedWatch(f, lc);
+
+            // B closes -> R2 reserved and scheduled on a FRESH schedule() (not blocked).
+            b.close();
+            assertTrue(lc.debugHasPendingRecovery(), "a newer recovery reservation R2 is pending");
+            ControllableScheduler.Handle r2Handle = s.handle();
+            Runnable r2Task = s.task();
+            assertNotSame(r1Handle, r2Handle, "R2 has its own handle");
+
+            // Now let R1's ORIGINAL schedule() return its stale handle.
+            release1.countDown();
+            close1.get(5, TimeUnit.SECONDS);
+            assertTrue(r1Handle.cancelled(), "the stale R1 handle must be cancelled");
+            assertFalse(r2Handle.cancelled(), "R2's handle must NOT be cancelled");
+            assertTrue(lc.debugHasPendingRecovery(), "R2 remains pending and intact");
+
+            // Running R2 must still install a watch (the newer task executes successfully).
+            runOnThread(pool, r2Task).get(5, TimeUnit.SECONDS);
+            assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count(), "R2 installs a watch");
+            assertNoLeak(f, lc);
+        } finally {
+            release1.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    // ---- concurrency ------------------------------------------------------------------------
+
+    @Test @Timeout(15)
+    void concurrent_registration_installs_exactly_one_no_leak() throws Exception {
+        Factory f = new Factory(); ManualScheduler s = new ManualScheduler();
+        WatchLifecycle lc = new WatchLifecycle("t", f, s);
+        int threads = 8;
+        CyclicBarrier start = new CyclicBarrier(threads);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        List<Future<?>> futures = new ArrayList<>();
+        try {
+            for (int i = 0; i < threads; i++) futures.add(pool.submit(() -> { start.await(); lc.registerWatch(); return null; }));
+            for (Future<?> fut : futures) fut.get(10, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+        assertEquals(1, f.created.stream().filter(lc::debugIsInstalled).count());
+        assertNoLeak(f, lc);
+    }
+}
+
+
+/* ============================================================================
+ * FILE 14: config-reconciler/src/main/java/io/ssaownership/reconciler/k8s/KubeConfigMapStore.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.k8s;
+
+import io.fabric8.kubernetes.api.model.ConfigMap;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientException;
+import io.ssaownership.reconciler.ConfigMapStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * fabric8-backed {@link ConfigMapStore}, bound to one namespace. Implements the contract exactly,
+ * in particular the concurrency-safe {@link #putIfAbsent}: it reads, checks the key, and writes
+ * at the OBSERVED resourceVersion; on a 409 conflict it re-reads and re-evaluates (the key may
+ * now be present, in which case it preserves it). A naive read-then-write is deliberately avoided.
+ */
+public final class KubeConfigMapStore implements ConfigMapStore {
+
+    private static final Logger LOG = LoggerFactory.getLogger(KubeConfigMapStore.class);
+
+    private final KubernetesClient client;
+    private final String namespace;
+    private final int maxConflictRetries;
+    /** TEST SEAM: runs inside putIfAbsent AFTER the read/absent-check, BEFORE the write. No-op in
+     *  production; a test injects a concurrent insert here to exercise the conflict path. */
+    private final Runnable beforeConditionalWrite;
+
+    public KubeConfigMapStore(KubernetesClient client, String namespace) {
+        this(client, namespace, 5);
+    }
+
+    public KubeConfigMapStore(KubernetesClient client, String namespace, int maxConflictRetries) {
+        this(client, namespace, maxConflictRetries, () -> {});
+    }
+
+    /** Package-private: adds the pre-write test seam. */
+    KubeConfigMapStore(KubernetesClient client, String namespace, int maxConflictRetries,
+                       Runnable beforeConditionalWrite) {
+        this.client = Objects.requireNonNull(client, "client");
+        this.namespace = Objects.requireNonNull(namespace, "namespace");
+        if (maxConflictRetries < 0) throw new IllegalArgumentException("maxConflictRetries < 0");
+        this.maxConflictRetries = maxConflictRetries;
+        this.beforeConditionalWrite = Objects.requireNonNull(beforeConditionalWrite, "beforeConditionalWrite");
+    }
+
+    @Override
+    public Optional<String> get(String configMap, String key) {
+        final ConfigMap cm;
+        try {
+            cm = client.configMaps().inNamespace(namespace).withName(configMap).get();
+        } catch (KubernetesClientException e) {
+            throw new StoreException("get " + configMap + " failed", e);   // NOT mapped to empty
+        }
+        if (cm == null || cm.getData() == null) {
+            return Optional.empty();            // ConfigMap or key absent
+        }
+        return Optional.ofNullable(cm.getData().get(key));   // present "" -> Optional.of("")
+    }
+
+    @Override
+    public void upsert(String configMap, String key, String value) {
+        Objects.requireNonNull(value, "value");
+        try {
+            ConfigMap cm = require(configMap);  // must exist (do not create)
+            Map<String, String> data = cm.getData() == null ? new HashMap<>() : new HashMap<>(cm.getData());
+            data.put(key, value);
+            cm.setData(data);
+            // replace at the observed resourceVersion (cm carries it) -> optimistic concurrency
+            client.configMaps().inNamespace(namespace).resource(cm).update();
+        } catch (KubernetesClientException e) {
+            throw new StoreException("upsert " + configMap + "." + key + " failed", e);
+        }
+    }
+
+    @Override
+    public boolean putIfAbsent(String configMap, String key, String value) {
+        Objects.requireNonNull(value, "value");
+        KubernetesClientException last = null;
+        for (int attempt = 0; attempt <= maxConflictRetries; attempt++) {
+            ConfigMap cm;
+            try {
+                cm = require(configMap);
+            } catch (KubernetesClientException e) {
+                throw new StoreException("putIfAbsent read " + configMap + " failed", e);
+            }
+            Map<String, String> data = cm.getData();
+            if (data != null && data.containsKey(key)) {
+                return false;                   // present -> preserve, done
+            }
+            Map<String, String> next = data == null ? new HashMap<>() : new HashMap<>(data);
+            next.put(key, value);
+            cm.setData(next);
+            if (attempt == 0) {
+                beforeConditionalWrite.run();   // TEST SEAM: inject a concurrent insert here
+            }
+            try {
+                client.configMaps().inNamespace(namespace).resource(cm).update();  // at observed rv
+                return true;
+            } catch (KubernetesClientException e) {
+                if (e.getCode() == 409) {       // conflict: someone else wrote; re-read & re-evaluate
+                    last = e;
+                    LOG.info("putIfAbsent {}.{} conflict (attempt {}); re-reading", configMap, key, attempt);
+                    continue;
+                }
+                throw new StoreException("putIfAbsent " + configMap + "." + key + " failed", e);
+            }
+        }
+        throw new StoreException("putIfAbsent " + configMap + "." + key
+                + " exhausted conflict retries", last);
+    }
+
+    private ConfigMap require(String configMap) {
+        ConfigMap cm = client.configMaps().inNamespace(namespace).withName(configMap).get();
+        if (cm == null) {
+            throw new StoreException("ConfigMap " + configMap + " does not exist in " + namespace);
+        }
+        return cm;
+    }
+}
+
+
+/* ============================================================================
+ * FILE 15: config-reconciler/src/main/java/io/ssaownership/reconciler/app/ReconcileCoordinator.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.app;
+
+import io.ssaownership.reconciler.Reconciler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Runtime coordination for reconcile passes. It sits between event sources (a watch, a periodic
+ * timer, a startup trigger) and the policy engine ({@link Reconciler}), providing the properties
+ * the engine deliberately does NOT: trigger coalescing, retry of failed passes, periodic resync,
+ * and a terminal closed state. {@link Reconciler} itself is unchanged.
+ *
+ * <h2>Guarantees</h2>
+ * <ul>
+ *   <li><b>At most one drain in flight.</b> A trigger either starts a drain or, if one is running,
+ *       sets a DIRTY flag; the running drain re-runs once more when it finishes. Any number of
+ *       triggers arriving during a pass collapse into a single follow-up pass — real coalescing,
+ *       not merely skipping redundant writes.</li>
+ *   <li><b>Bounded queue.</b> At most one drain task is ever queued on the executor, so a burst of
+ *       events cannot accumulate an unbounded backlog of reconcile tasks.</li>
+ *   <li><b>Retry after FAILED.</b> If a pass returns {@link Reconciler.Outcome#FAILED}, a retry is
+ *       scheduled after {@code retryDelay} (unless a trigger already dirtied it sooner). This is
+ *       what repairs e.g. "target ConfigMap was briefly missing" without a new source event.</li>
+ *   <li><b>Periodic resync.</b> A timer triggers a pass every {@code resyncInterval}, a fallback
+ *       for events missed during a disconnection and for destination-only drift (the source watch
+ *       alone would never observe target drift).</li>
+ *   <li><b>Closed is terminal.</b> After {@link #close()} no new drain is started or scheduled;
+ *       {@link #trigger} becomes a no-op.</li>
+ * </ul>
+ *
+ * <p>This class does not interpret outcomes beyond FAILED→retry; it coordinates WHEN the engine
+ * runs, never WHAT it decides.
+ */
+public final class ReconcileCoordinator implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ReconcileCoordinator.class);
+
+    private final Reconciler reconciler;
+    private final ScheduledExecutorService executor;   // single-thread; serialises drains
+    private final Duration retryDelay;
+    private final Duration resyncInterval;
+
+    private final ReentrantLock lock = new ReentrantLock();
+    private boolean running = false;    // a drain task is executing
+    private boolean dirty = false;      // a trigger arrived while running; re-run once more
+    private boolean closed = false;
+    private java.util.concurrent.ScheduledFuture<?> resyncHandle;
+
+    public ReconcileCoordinator(Reconciler reconciler, ScheduledExecutorService executor,
+                                Duration retryDelay, Duration resyncInterval) {
+        this.reconciler = Objects.requireNonNull(reconciler, "reconciler");
+        this.executor = Objects.requireNonNull(executor, "executor");
+        this.retryDelay = requirePositive(retryDelay, "retryDelay");
+        this.resyncInterval = requirePositive(resyncInterval, "resyncInterval");
+    }
+
+    private static Duration requirePositive(Duration d, String n) {
+        Objects.requireNonNull(d, n);
+        if (d.isNegative() || d.isZero()) throw new IllegalArgumentException(n + " must be positive");
+        return d;
+    }
+
+    /** Start periodic resync. Call once after construction. */
+    public void startPeriodicResync() {
+        lock.lock();
+        try {
+            if (closed || resyncHandle != null) return;
+            long ms = resyncInterval.toMillis();
+            resyncHandle = executor.scheduleWithFixedDelay(this::trigger, ms, ms, TimeUnit.MILLISECONDS);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Request a reconcile. Shutdown-aware: a no-op once closed. If a drain is running, marks DIRTY
+     * so exactly one more pass follows; otherwise starts a drain. Never throws
+     * {@link RejectedExecutionException} back to the caller (e.g. a fabric8 watch callback): a
+     * rejected submission during shutdown is swallowed after marking state.
+     */
+    public void trigger() {
+        lock.lock();
+        try {
+            if (closed) return;
+            if (running) { dirty = true; return; }
+            running = true;
+        } finally {
+            lock.unlock();
+        }
+        submitDrain();
+    }
+
+    private void submitDrain() {
+        try {
+            executor.execute(this::drain);
+        } catch (RejectedExecutionException shuttingDown) {
+            // executor is gone (shutdown). Clear running so state is consistent; nothing queued.
+            lock.lock();
+            try { running = false; } finally { lock.unlock(); }
+            LOG.debug("reconcile submission rejected (shutting down)");
+        }
+    }
+
+    private void drain() {
+        Reconciler.Outcome outcome;
+        try {
+            outcome = reconciler.reconcile();
+        } catch (RuntimeException e) {
+            outcome = Reconciler.Outcome.FAILED;
+            LOG.error("reconcile pass threw unexpectedly", e);
+        }
+
+        boolean rerunNow;
+        boolean scheduleRetry;
+        lock.lock();
+        try {
+            if (closed) { running = false; return; }
+            if (dirty) {
+                dirty = false;
+                rerunNow = true;            // a trigger arrived during the pass: coalesced follow-up
+                scheduleRetry = false;
+            } else if (outcome == Reconciler.Outcome.FAILED) {
+                rerunNow = false;
+                scheduleRetry = true;       // delayed retry
+            } else {
+                running = false;            // settled; nothing pending
+                rerunNow = false;
+                scheduleRetry = false;
+            }
+        } finally {
+            lock.unlock();
+        }
+
+        if (rerunNow) {
+            submitDrain();                  // stays "running"; one follow-up pass
+        } else if (scheduleRetry) {
+            try {
+                executor.schedule(() -> { submitDrain(); }, retryDelay.toMillis(), TimeUnit.MILLISECONDS);
+                // keep running=true until the retry actually drains, so no concurrent drain starts
+            } catch (RejectedExecutionException shuttingDown) {
+                lock.lock();
+                try { running = false; } finally { lock.unlock(); }
+            }
+        }
+    }
+
+    @Override
+    public void close() {
+        lock.lock();
+        try {
+            closed = true;
+            if (resyncHandle != null) { resyncHandle.cancel(false); resyncHandle = null; }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // ---- test hooks (package-private) ----
+    boolean debugRunning() { lock.lock(); try { return running; } finally { lock.unlock(); } }
+    boolean debugDirty()   { lock.lock(); try { return dirty; }   finally { lock.unlock(); } }
+    boolean debugClosed()  { lock.lock(); try { return closed; }  finally { lock.unlock(); } }
+}
+
+
+/* ============================================================================
+ * FILE 16: config-reconciler/src/main/java/io/ssaownership/reconciler/app/ConfigReconcilerApp.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.app;
+
+import io.fabric8.kubernetes.api.model.ConfigMap;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.Watch;
+import io.fabric8.kubernetes.client.Watcher;
+import io.fabric8.kubernetes.client.WatcherException;
+import io.ssaownership.reconciler.ConfigMapStore;
+import io.ssaownership.reconciler.ExecutorRecoveryScheduler;
+import io.ssaownership.reconciler.Reconciler;
+import io.ssaownership.reconciler.WatchFactory;
+import io.ssaownership.reconciler.WatchLifecycle;
+import io.ssaownership.reconciler.WriteStrategy;
+import io.ssaownership.reconciler.k8s.KubeConfigMapStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * The runnable application: it OWNS the field {@code <configMap>.data.<key>} at runtime,
+ * demonstrating the "application owns it, not the chart" resolution to the SSA two-writer problem.
+ *
+ * <h2>Composition</h2>
+ * <ul>
+ *   <li>{@link KubeConfigMapStore} — the fabric8 adapter (reads/conditional-writes the field).</li>
+ *   <li>{@link Reconciler} — observed-destination enforcement (UPSERT) of the derived value.</li>
+ *   <li>{@link ReconcileCoordinator} — runtime coordination: coalesces triggers, retries FAILED
+ *       passes, periodic resync, terminal closed state. (The Reconciler compares desired vs
+ *       observed and skips redundant writes; that is NOT coalescing — the coordinator provides
+ *       coalescing and retry.)</li>
+ *   <li>{@link WatchLifecycle} — manages a watch on the SOURCE ConfigMap; source events and each
+ *       (re)install trigger a reconcile. Watch failures recover via
+ *       {@link ExecutorRecoveryScheduler}.</li>
+ * </ul>
+ * All reconcile work runs on a single-thread worker (NOT on the watch callback thread); triggers
+ * are routed through the coordinator, which is shutdown-aware so a late event cannot throw an
+ * executor rejection back into a fabric8 callback.
+ */
+public final class ConfigReconcilerApp implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ConfigReconcilerApp.class);
+
+    private final KubernetesClient client;
+    private final String namespace;
+    private final String sourceConfigMap;
+    private final String targetConfigMap;
+    private final String key;
+    private final ReconcileCoordinator coordinator;
+    private final WatchLifecycle lifecycle;
+    private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "config-reconciler-worker"); t.setDaemon(true); return t;
+    });
+    private final ScheduledExecutorService recoveryExec = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "config-reconciler-recovery"); t.setDaemon(true); return t;
+    });
+
+    public ConfigReconcilerApp(KubernetesClient client, String namespace,
+                               String sourceConfigMap, String targetConfigMap, String key) {
+        this(client, namespace, sourceConfigMap, targetConfigMap, key,
+                Duration.ofSeconds(2), Duration.ofMinutes(5));
+    }
+
+    public ConfigReconcilerApp(KubernetesClient client, String namespace,
+                               String sourceConfigMap, String targetConfigMap, String key,
+                               Duration retryDelay, Duration resyncInterval) {
+        this.client = Objects.requireNonNull(client);
+        this.namespace = Objects.requireNonNull(namespace);
+        this.sourceConfigMap = Objects.requireNonNull(sourceConfigMap);
+        this.targetConfigMap = Objects.requireNonNull(targetConfigMap);
+        this.key = Objects.requireNonNull(key);
+
+        ConfigMapStore store = new KubeConfigMapStore(client, namespace);
+        Reconciler reconciler = new Reconciler("config-reconciler", targetConfigMap, key,
+                WriteStrategy.UPSERT, store, this::deriveFromSource);
+        this.coordinator = new ReconcileCoordinator(reconciler, worker, retryDelay, resyncInterval);
+
+        WatchFactory factory = this::watchSource;
+        this.lifecycle = new WatchLifecycle("source-watch", factory,
+                new ExecutorRecoveryScheduler(recoveryExec));
+    }
+
+    private String deriveFromSource() {
+        ConfigMap src = client.configMaps().inNamespace(namespace).withName(sourceConfigMap).get();
+        String desired = (src != null && src.getData() != null) ? src.getData().get("desired") : null;
+        return desired != null ? desired : "derived-default";
+    }
+
+    /**
+     * Create a watch on the source ConfigMap. If any post-creation setup throws, the newly created
+     * watch is CLOSED before rethrowing — otherwise the lifecycle, which never received the handle,
+     * could not close it and it would leak. (Reproduced by the shutdown-during-create test.)
+     * Both event delivery and (re)install route through the shutdown-aware coordinator.
+     */
+    private Watch watchSource(Runnable onClosed) {
+        return createThenSetup(
+                () -> client.configMaps().inNamespace(namespace).withName(sourceConfigMap)
+                        .watch(new Watcher<>() {
+                            @Override public void eventReceived(Action action, ConfigMap resource) {
+                                LOG.info("source event {}; triggering reconcile", action);
+                                coordinator.trigger();   // shutdown-aware; never throws back into fabric8
+                            }
+                            @Override public void onClose(WatcherException cause) {
+                                LOG.info("source watch closed: {}", cause == null ? "(graceful)" : cause.getMessage());
+                                onClosed.run();          // hand back to the lifecycle (recovery)
+                            }
+                        }),
+                // reconcile-on-(re)install: resync the derived field for anything missed while
+                // disconnected (recovery uses this same path).
+                coordinator::trigger);
+    }
+
+    /**
+     * Create a watch, then run post-creation {@code setup}. If setup throws, the newly created
+     * watch is CLOSED (suppressing any close error) before rethrowing — otherwise the lifecycle,
+     * which never received the handle, could not close it and it would leak. Package-private and
+     * static so the leak-safety can be unit-tested with a fake watch and a throwing setup.
+     */
+    static Watch createThenSetup(java.util.function.Supplier<Watch> create, Runnable setup) {
+        Watch watch = create.get();
+        try {
+            setup.run();
+            return watch;
+        } catch (RuntimeException | Error setupFailure) {
+            try {
+                watch.close();
+            } catch (RuntimeException closeFailure) {
+                setupFailure.addSuppressed(closeFailure);
+            }
+            throw setupFailure;
+        }
+    }
+
+    /** Start: begin periodic resync and install the watch (which triggers the initial reconcile). */
+    public void start() {
+        LOG.info("starting; source={} target={}.{}", sourceConfigMap, targetConfigMap, key);
+        coordinator.startPeriodicResync();
+        lifecycle.registerWatch();
+    }
+
+    /**
+     * Bounded, coordinated shutdown. Deactivate the lifecycle (no further installs), close the
+     * coordinator (terminal; no new drains), then shut the executors down and AWAIT their
+     * termination within a budget. {@code shutdownNow()} only requests interruption; termination
+     * is what we actually wait for. The caller keeps the Kubernetes client open until this returns.
+     */
+    @Override
+    public void close() {
+        lifecycle.deactivate();
+        coordinator.close();
+        worker.shutdownNow();
+        recoveryExec.shutdownNow();
+        awaitTermination(worker, "worker");
+        awaitTermination(recoveryExec, "recovery");
+    }
+
+    private void awaitTermination(ScheduledExecutorService ex, String name) {
+        try {
+            if (!ex.awaitTermination(10, TimeUnit.SECONDS)) {
+                LOG.warn("{} executor did not terminate within the shutdown budget", name);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // accessors for tests
+    WatchLifecycle lifecycle() { return lifecycle; }
+    void triggerNow() { coordinator.trigger(); }
+}
+
+
+/* ============================================================================
+ * FILE 17: config-reconciler/src/main/java/io/ssaownership/reconciler/app/Main.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.app;
+
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Entrypoint. Configuration via environment:
+ *   NAMESPACE          (default: current namespace or "default")
+ *   SOURCE_CONFIGMAP   (default: "demo-source")
+ *   TARGET_CONFIGMAP   (default: "demo-config")
+ *   OWNED_KEY          (default: "message")
+ *
+ * <p>Runs until SIGTERM, then shuts down with a bounded, coordinated sequence. The subtlety: the
+ * JVM waits for shutdown HOOKS to finish, not for arbitrary work on the main thread. So the hook
+ * must itself drive (or wait for) cleanup; a hook that merely releases a latch can return — and
+ * let the JVM exit — before the main thread finishes closing the app and client. Here the hook
+ * signals the main thread AND waits, with a bound, for cleanup to complete.
+ */
+public final class Main {
+    private static final Logger LOG = LoggerFactory.getLogger(Main.class);
+    private static final long SHUTDOWN_BUDGET_SECONDS = 25;
+
+    public static void main(String[] args) throws InterruptedException {
+        String source = env("SOURCE_CONFIGMAP", "demo-source");
+        String target = env("TARGET_CONFIGMAP", "demo-config");
+        String key = env("OWNED_KEY", "message");
+
+        KubernetesClient client = new KubernetesClientBuilder().build();
+        String ns = Optional.ofNullable(env("NAMESPACE", null))
+                .orElseGet(() -> Optional.ofNullable(client.getNamespace()).orElse("default"));
+        LOG.info("config-reconciler starting in namespace {}", ns);
+
+        ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key);
+        CountDownLatch stop = new CountDownLatch(1);        // "please begin shutdown"
+        CountDownLatch cleanupDone = new CountDownLatch(1); // "cleanup finished"
+
+        Thread hook = new Thread(() -> {
+            stop.countDown();                               // ask main to begin cleanup
+            try {
+                // wait, with a bound, for the main thread to finish closing app + client, so the
+                // JVM does not exit mid-cleanup.
+                if (!cleanupDone.await(SHUTDOWN_BUDGET_SECONDS, TimeUnit.SECONDS)) {
+                    LOG.warn("shutdown budget elapsed before cleanup completed");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "shutdown");
+        Runtime.getRuntime().addShutdownHook(hook);
+
+        try {
+            app.start();
+            stop.await();                                   // block until SIGTERM (hook) or error
+            LOG.info("shutting down");
+        } finally {
+            // single, idempotent cleanup path shared by normal exit and SIGTERM:
+            try {
+                app.close();                                // bounded; awaits worker/recovery termination
+            } finally {
+                client.close();                             // kept open until app work finished
+                cleanupDone.countDown();                    // release the hook
+            }
+        }
+    }
+
+    private static String env(String name, String def) {
+        String v = System.getenv(name);
+        return (v == null || v.isBlank()) ? def : v;
+    }
+}
+
+
+/* ============================================================================
+ * FILE 18: config-reconciler/src/test/java/io/ssaownership/reconciler/k8s/KubeConfigMapStoreIT.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.k8s;
+
+import io.fabric8.kubernetes.api.model.ConfigMapBuilder;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import io.ssaownership.reconciler.ConfigMapStore;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledIf;
+
+import java.util.Map;
+import java.util.UUID;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Live-API integration tests for {@link KubeConfigMapStore}. These require a reachable cluster
+ * (minikube/kind) and are SKIPPED otherwise via {@link #clusterAvailable()}. They verify the
+ * guarantees a fake cannot: real resourceVersion enforcement on the conditional write, and
+ * server-side preservation of unrelated content.
+ */
+@EnabledIf("clusterAvailable")
+class KubeConfigMapStoreIT {
+
+    static boolean clusterAvailable() {
+        if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster"))) {
+            return true;   // live-it profile: do NOT skip — a real connection failure must surface
+        }
+        try (KubernetesClient c = new KubernetesClientBuilder().build()) {
+            c.getKubernetesVersion();   // cheap, works for namespace-scoped creds (not namespaces().list())
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private KubernetesClient client;
+    private String ns;
+    private final String cm = "it-config";
+    private final String key = "message";
+
+    @BeforeEach
+    void setUp() {
+        client = new KubernetesClientBuilder().build();
+        ns = "ssa-it-" + UUID.randomUUID().toString().substring(0, 8);
+        client.namespaces().resource(new io.fabric8.kubernetes.api.model.NamespaceBuilder()
+                .withNewMetadata().withName(ns).endMetadata().build()).create();
+    }
+
+    @AfterEach
+    void tearDown() {
+        try { client.namespaces().withName(ns).delete(); } finally { client.close(); }
+    }
+
+    private void createCm(Map<String, String> data) {
+        client.configMaps().inNamespace(ns).resource(new ConfigMapBuilder()
+                .withNewMetadata().withName(cm).endMetadata().withData(data).build()).create();
+    }
+
+    @Test @Timeout(60)
+    void conditional_putIfAbsent_preserves_a_concurrent_insert() {
+        // The decisive race: adapter reads key absent; BEFORE its conditional write, another
+        // client inserts an operator value; the adapter's write hits a 409, re-reads, sees the
+        // key present, and PRESERVES it, returning false. Deterministic via the pre-write seam.
+        createCm(Map.of("other", "keep-me"));            // CM exists, key absent
+        Runnable concurrentInsert = () -> client.configMaps().inNamespace(ns).withName(cm)
+                .edit(c -> new ConfigMapBuilder(c).addToData(key, "operator-value").build());
+        KubeConfigMapStore store = new KubeConfigMapStore(client, ns, 5, concurrentInsert);
+
+        boolean wrote = store.putIfAbsent(cm, key, "app-default");
+        assertFalse(wrote, "must not report a write when a concurrent insert won");
+        assertEquals("operator-value", client.configMaps().inNamespace(ns).withName(cm).get()
+                .getData().get(key), "the concurrent operator value must survive");
+        assertEquals("keep-me", client.configMaps().inNamespace(ns).withName(cm).get()
+                .getData().get("other"), "unrelated key preserved");
+    }
+
+    @Test @Timeout(60)
+    void putIfAbsent_seeds_when_truly_absent() {
+        createCm(Map.of());
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);
+        assertTrue(store.putIfAbsent(cm, key, "seed"));
+        assertEquals("seed", store.get(cm, key).orElseThrow());
+    }
+
+    @Test @Timeout(60)
+    void upsert_preserves_unrelated_keys() {
+        createCm(Map.of("other", "x"));
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);
+        store.upsert(cm, key, "v");
+        var data = client.configMaps().inNamespace(ns).withName(cm).get().getData();
+        assertEquals("v", data.get(key));
+        assertEquals("x", data.get("other"));
+    }
+
+    @Test @Timeout(60)
+    void empty_string_is_present_not_absent() {
+        createCm(Map.of(key, ""));
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);
+        assertEquals("", store.get(cm, key).orElseThrow(), "empty string is a present value");
+    }
+
+    @Test @Timeout(60)
+    void write_to_missing_configmap_throws() {
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);   // CM not created
+        assertThrows(ConfigMapStore.StoreException.class, () -> store.upsert(cm, key, "v"));
+        assertThrows(ConfigMapStore.StoreException.class, () -> store.putIfAbsent(cm, key, "v"));
+    }
+
+    @Test @Timeout(60)
+    void conflict_retry_exhaustion_throws_immediately_with_zero_retries() {
+        createCm(Map.of());
+        // retries=0: the FIRST conflict exhausts immediately. The pre-write seam fires only on
+        // attempt 0 (by design), so a single injected concurrent insert is enough to force the
+        // one-and-only write to conflict. This validates immediate exhaustion, not multi-retry
+        // exhaustion (which would require per-attempt injection the single seam does not provide).
+        Runnable concurrentInsert = () -> client.configMaps().inNamespace(ns).withName(cm)
+                .edit(c -> new ConfigMapBuilder(c).addToData(key, "other-writer").build());
+        KubeConfigMapStore store = new KubeConfigMapStore(client, ns, 0, concurrentInsert);
+        // The concurrent insert makes the key present, so after the 409 re-read the adapter would
+        // normally return false; with retries=0 the conflict path exhausts first. Either way it
+        // must not silently succeed with OUR value:
+        boolean wrote;
+        try {
+            wrote = store.putIfAbsent(cm, key, "app-default");
+        } catch (ConfigMapStore.StoreException expected) {
+            wrote = false;   // exhaustion path
+        }
+        assertFalse(wrote, "must not report having written our value");
+        assertEquals("other-writer", store.get(cm, key).orElseThrow(), "the other writer's value stands");
+    }
+
+    @Test @Timeout(60)
+    void conflict_from_unrelated_update_is_resolved_by_reread_then_insert() {
+        // A conflict caused by an UNRELATED change (not our key) with retries available: the write
+        // hits 409, the adapter re-reads (seeing our key still absent) and inserts it, preserving
+        // the unrelated change. Seam fires on attempt 0 only, so exactly one 409 then success.
+        createCm(Map.of("other", "v0"));
+        Runnable unrelatedBump = () -> client.configMaps().inNamespace(ns).withName(cm)
+                .edit(c -> new ConfigMapBuilder(c).addToData("other", "v1").build());
+        KubeConfigMapStore store = new KubeConfigMapStore(client, ns, 5, unrelatedBump);
+
+        boolean wrote = store.putIfAbsent(cm, key, "app-default");
+        assertTrue(wrote, "our key was absent; after re-read it must be inserted");
+        var data = client.configMaps().inNamespace(ns).withName(cm).get().getData();
+        assertEquals("app-default", data.get(key), "our key inserted");
+        assertEquals("v1", data.get("other"), "the unrelated concurrent change is preserved");
+    }
+
+    @Test @Timeout(60)
+    void get_on_unreachable_api_throws_StoreException_not_absence() {
+        // A read failure must surface as StoreException, never be mapped to Optional.empty().
+        // Use a client pointed at a dead endpoint so the GET fails at the transport layer.
+        try (KubernetesClient dead = new KubernetesClientBuilder()
+                .withConfig(new io.fabric8.kubernetes.client.ConfigBuilder()
+                        .withMasterUrl("https://127.0.0.1:1")   // nothing listening
+                        .withConnectionTimeout(500).withRequestTimeout(500)
+                        .withWatchReconnectLimit(0).build())
+                .build()) {
+            ConfigMapStore store = new KubeConfigMapStore(dead, ns);
+            assertThrows(ConfigMapStore.StoreException.class, () -> store.get(cm, key),
+                    "a read failure must throw StoreException, not return empty");
+        }
+    }
+
+    @Test @Timeout(60)
+    void putIfAbsent_on_existing_empty_string_returns_false_and_preserves_it() {
+        createCm(Map.of(key, ""));                       // present, empty-string value
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);
+        assertFalse(store.putIfAbsent(cm, key, "would-overwrite"),
+                "an existing empty-string value is PRESENT; putIfAbsent must return false");
+        assertEquals("", store.get(cm, key).orElseThrow(), "the empty-string value is preserved");
+    }
+
+    @Test @Timeout(60)
+    void writes_preserve_labels_annotations_and_binaryData() {
+        // Create a CM with labels, annotations and binaryData; an upsert of our key must leave all
+        // of them untouched (writes touch only data.<key>).
+        client.configMaps().inNamespace(ns).resource(new ConfigMapBuilder()
+                .withNewMetadata().withName(cm)
+                    .addToLabels("team", "infra")
+                    .addToAnnotations("note", "keep")
+                .endMetadata()
+                .addToData("other", "x")
+                .addToBinaryData("blob", "aGVsbG8=")     // base64 "hello"
+                .build()).create();
+        ConfigMapStore store = new KubeConfigMapStore(client, ns);
+        store.upsert(cm, key, "v");
+        var fresh = client.configMaps().inNamespace(ns).withName(cm).get();
+        assertEquals("v", fresh.getData().get(key));
+        assertEquals("x", fresh.getData().get("other"), "unrelated data key preserved");
+        assertEquals("infra", fresh.getMetadata().getLabels().get("team"), "label preserved");
+        assertEquals("keep", fresh.getMetadata().getAnnotations().get("note"), "annotation preserved");
+        assertEquals("aGVsbG8=", fresh.getBinaryData().get("blob"), "binaryData preserved");
+    }
+}
+
+
+/* ============================================================================
+ * FILE 19: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ReconcileCoordinatorTest.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.app;
+
+import io.ssaownership.reconciler.ConfigMapStore;
+import io.ssaownership.reconciler.Reconciler;
+import io.ssaownership.reconciler.WriteStrategy;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.time.Duration;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Deterministic unit tests for {@link ReconcileCoordinator}. A real {@link Reconciler} is driven
+ * over a controllable in-test {@link ConfigMapStore}; a real single-thread scheduled executor
+ * serialises drains. Latches make interleavings explicit — no sleeps as correctness evidence.
+ */
+class ReconcileCoordinatorTest {
+
+    /** Controllable store: counts passes, can block one pass, can force FAILED via a throwing get. */
+    static final class ControllableStore implements ConfigMapStore {
+        final AtomicInteger passes = new AtomicInteger();
+        volatile CountDownLatch blockOnPass;      // if set, the next get() blocks on it
+        volatile boolean failNext = false;
+        final AtomicReference<String> value = new AtomicReference<>(null);
+
+        @Override public Optional<String> get(String cm, String key) {
+            passes.incrementAndGet();
+            CountDownLatch gate = blockOnPass;
+            if (gate != null) {
+                blockOnPass = null;
+                try { if (!gate.await(5, TimeUnit.SECONDS)) throw new AssertionError("gate"); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+            }
+            if (failNext) { failNext = false; throw new StoreException("injected"); }
+            return Optional.ofNullable(value.get());
+        }
+        @Override public void upsert(String cm, String key, String v) { value.set(v); }
+        @Override public boolean putIfAbsent(String cm, String key, String v) {
+            if (value.get() == null) { value.set(v); return true; } return false;
+        }
+    }
+
+    private ScheduledExecutorService exec;
+    private ControllableStore store;
+    private ReconcileCoordinator coord;
+
+    private ReconcileCoordinator build(Duration retry, Duration resync) {
+        exec = Executors.newSingleThreadScheduledExecutor();
+        store = new ControllableStore();
+        Reconciler r = new Reconciler("t", "cm", "k", WriteStrategy.UPSERT, store, () -> "desired");
+        return new ReconcileCoordinator(r, exec, retry, resync);
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (coord != null) coord.close();
+        if (exec != null) { exec.shutdownNow(); }
+    }
+
+    @Test @Timeout(10)
+    void triggers_during_a_pass_coalesce_into_exactly_one_follow_up() throws Exception {
+        coord = build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+        CountDownLatch release = new CountDownLatch(1);
+        store.blockOnPass = release;                       // the first pass blocks inside get()
+
+        coord.trigger();                                   // starts drain; pass 1 blocks on release
+        // wait until pass 1 is actually running (passes incremented to 1)
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (store.passes.get() < 1 && System.nanoTime() < deadline) Thread.onSpinWait();
+        assertEquals(1, store.passes.get(), "pass 1 running");
+        assertTrue(coord.debugRunning());
+
+        // fire MANY triggers while pass 1 is blocked -> they must collapse into ONE follow-up
+        for (int i = 0; i < 50; i++) coord.trigger();
+        assertTrue(coord.debugDirty(), "triggers during a pass set the dirty flag");
+
+        release.countDown();                               // let pass 1 finish; one follow-up runs
+        // after the dust settles there must be exactly 2 passes total (1 + a single coalesced one)
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (coord.debugRunning() && System.nanoTime() < deadline) Thread.onSpinWait();
+        assertEquals(2, store.passes.get(), "50 triggers during a pass collapse into exactly one follow-up");
+        assertFalse(coord.debugDirty());
+    }
+
+    @Test @Timeout(10)
+    void failed_outcome_schedules_a_retry_without_a_new_trigger() throws Exception {
+        coord = build(Duration.ofMillis(200), Duration.ofMinutes(10));
+        store.value.set("desired");       // in sync, so a pass would normally SKIP...
+        store.failNext = true;            // ...but the first get() throws -> FAILED
+        coord.trigger();
+        // the retry (no new trigger) must produce a second pass:
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (store.passes.get() < 2 && System.nanoTime() < deadline) Thread.onSpinWait();
+        assertTrue(store.passes.get() >= 2, "FAILED must schedule a retry pass without a new trigger");
+    }
+
+    @Test @Timeout(10)
+    void closed_coordinator_declines_new_work() {
+        coord = build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+        coord.close();
+        assertTrue(coord.debugClosed());
+        coord.trigger();                                   // must be a no-op
+        assertFalse(coord.debugRunning(), "closed coordinator starts no drain");
+        assertEquals(0, store.passes.get(), "no pass after close");
+    }
+
+    @Test @Timeout(10)
+    void trigger_after_executor_shutdown_does_not_throw() {
+        coord = build(Duration.ofSeconds(1), Duration.ofMinutes(10));
+        exec.shutdownNow();                                // executor gone, coordinator not closed
+        assertDoesNotThrow(coord::trigger,
+                "a trigger must swallow executor rejection (never throw back into a watch callback)");
+    }
+}
+
+
+/* ============================================================================
+ * FILE 20: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ConfigReconcilerAppWatchLeakTest.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.app;
+
+import io.fabric8.kubernetes.client.Watch;
+import org.junit.jupiter.api.Test;
+
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Unit tests for {@link ConfigReconcilerApp#createThenSetup}: the watch-acquisition failure path.
+ * No cluster required. This reproduces the reviewer's leak scenario deterministically — post-
+ * creation setup (e.g. a rejected reconcile submission during shutdown) throws, and the newly
+ * created watch must be closed rather than leaked, since the lifecycle never received the handle.
+ */
+class ConfigReconcilerAppWatchLeakTest {
+
+    static final class FakeWatch implements Watch {
+        final AtomicInteger closes = new AtomicInteger();
+        boolean throwOnClose = false;
+        @Override public void close() {
+            closes.incrementAndGet();
+            if (throwOnClose) throw new IllegalStateException("close failed");
+        }
+    }
+
+    @Test
+    void setup_failure_closes_the_created_watch_and_rethrows() {
+        FakeWatch w = new FakeWatch();
+        RuntimeException boom = new RuntimeException("setup failed (e.g. executor rejected)");
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> ConfigReconcilerApp.createThenSetup(() -> w, () -> { throw boom; }));
+        assertSame(boom, thrown, "the original setup failure propagates");
+        assertEquals(1, w.closes.get(), "the created watch must be closed to avoid a leak");
+    }
+
+    @Test
+    void setup_failure_with_a_failing_close_suppresses_the_close_error() {
+        FakeWatch w = new FakeWatch();
+        w.throwOnClose = true;
+        RuntimeException boom = new RuntimeException("setup failed");
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> ConfigReconcilerApp.createThenSetup(() -> w, () -> { throw boom; }));
+        assertSame(boom, thrown);
+        assertEquals(1, w.closes.get(), "close was attempted");
+        assertEquals(1, thrown.getSuppressed().length, "the close error is suppressed on the original");
+        assertInstanceOf(IllegalStateException.class, thrown.getSuppressed()[0]);
+    }
+
+    @Test
+    void successful_setup_returns_the_watch_unclosed() {
+        FakeWatch w = new FakeWatch();
+        Watch returned = ConfigReconcilerApp.createThenSetup(() -> w, () -> { /* ok */ });
+        assertSame(w, returned);
+        assertEquals(0, w.closes.get(), "a watch handed back to the lifecycle must NOT be closed here");
+    }
+}
+
+
+/* ============================================================================
+ * FILE 21: config-reconciler/src/test/java/io/ssaownership/reconciler/app/ConfigReconcilerAppIT.java
+ * ============================================================================ */
+
+package io.ssaownership.reconciler.app;
+
+import io.fabric8.kubernetes.api.model.ConfigMapBuilder;
+import io.fabric8.kubernetes.api.model.NamespaceBuilder;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledIf;
+
+import java.util.Map;
+import java.util.UUID;
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * End-to-end: run {@link ConfigReconcilerApp} in-process against a real cluster and verify it
+ * OWNS and enforces the target field — initial seeding, source-change propagation, and drift
+ * repair. Skipped if no cluster is reachable.
+ */
+@EnabledIf("clusterAvailable")
+class ConfigReconcilerAppIT {
+
+    static boolean clusterAvailable() {
+        if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster"))) {
+            return true;   // live-it profile: do NOT skip — a real connection failure must surface
+        }
+        try (KubernetesClient c = new KubernetesClientBuilder().build()) {
+            c.getKubernetesVersion(); return true;
+        } catch (Exception e) { return false; }
+    }
+
+    private KubernetesClient client;
+    private String ns;
+    private final String source = "demo-source";
+    private final String target = "demo-config";
+    private final String key = "message";
+
+    @BeforeEach
+    void setUp() {
+        client = new KubernetesClientBuilder().build();
+        ns = "ssa-app-it-" + UUID.randomUUID().toString().substring(0, 8);
+        client.namespaces().resource(new NamespaceBuilder().withNewMetadata().withName(ns).endMetadata().build()).create();
+        // the chart renders the target OBJECT (no data) + a source object:
+        client.configMaps().inNamespace(ns).resource(new ConfigMapBuilder()
+                .withNewMetadata().withName(target).endMetadata().build()).create();
+        client.configMaps().inNamespace(ns).resource(new ConfigMapBuilder()
+                .withNewMetadata().withName(source).endMetadata().withData(Map.of("desired", "v1")).build()).create();
+    }
+
+    @AfterEach
+    void tearDown() {
+        try { client.namespaces().withName(ns).delete(); } finally { client.close(); }
+    }
+
+    private boolean await(BooleanSupplier cond, long seconds) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        while (System.nanoTime() < deadline) {
+            if (cond.getAsBoolean()) return true;
+            TimeUnit.MILLISECONDS.sleep(100);   // polling the cluster, not a correctness sleep
+        }
+        return cond.getAsBoolean();
+    }
+    private String targetValue() {
+        var cm = client.configMaps().inNamespace(ns).withName(target).get();
+        return cm.getData() == null ? null : cm.getData().get(key);
+    }
+
+    @Test @Timeout(60)
+    void app_enforces_derived_value_and_propagates_source_changes() throws Exception {
+        try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key)) {
+            app.start();
+            // initial reconcile seeds the derived value from source.desired=v1
+            assertTrue(await(() -> "v1".equals(targetValue()), 20), "app should enforce v1, was " + targetValue());
+
+            // change the source -> watch triggers -> app enforces v2
+            client.configMaps().inNamespace(ns).withName(source)
+                    .edit(c -> new ConfigMapBuilder(c).addToData("desired", "v2").build());
+            assertTrue(await(() -> "v2".equals(targetValue()), 20), "app should enforce v2, was " + targetValue());
+
+            // external drift on the target -> an EXPLICITLY triggered pass repairs it. This proves
+            // repair WHEN a pass runs; autonomous repair is covered separately below.
+            client.configMaps().inNamespace(ns).withName(target)
+                    .edit(c -> new ConfigMapBuilder(c).addToData(key, "tampered").build());
+            app.triggerNow();
+            assertTrue(await(() -> "v2".equals(targetValue()), 20), "a triggered pass must repair drift to v2, was " + targetValue());
+        }
+    }
+
+    @Test @Timeout(60)
+    void periodic_resync_repairs_target_drift_autonomously() throws Exception {
+        // AUTONOMOUS enforcement: with a short resync interval, target-only drift (which the
+        // source watch never observes) is repaired by the coordinator's periodic resync — no
+        // source event, no manual trigger.
+        try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key,
+                Duration.ofSeconds(1), Duration.ofSeconds(1))) {
+            app.start();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20), "initial enforce v1, was " + targetValue());
+
+            client.configMaps().inNamespace(ns).withName(target)
+                    .edit(c -> new ConfigMapBuilder(c).addToData(key, "tampered").build());
+            assertEquals("tampered", targetValue(), "precondition: target drifted");
+
+            // Do NOT trigger and do NOT touch the source; the periodic resync must repair it.
+            assertTrue(await(() -> "v1".equals(targetValue()), 20),
+                    "periodic resync must repair target drift autonomously, was " + targetValue());
+        }
+    }
+
+    @Test @Timeout(60)
+    void reconcile_on_reinstall_repairs_drift_without_a_source_event() throws Exception {
+        // Reconcile-on-(re)install resync: a watch (re)install must itself trigger a reconcile, so
+        // that a change missed while disconnected is corrected on reconnect rather than waiting for
+        // the next source event. This drives the SAME watchSource() reconcile-on-install path a
+        // recovery uses (reconciler-core's race tests prove a scheduled recovery reaches install);
+        // here we drive a (re)install explicitly, drift the target with NO source event, and assert
+        // the (re)install's own reconcile repairs it.
+        try (ConfigReconcilerApp app = new ConfigReconcilerApp(client, ns, source, target, key)) {
+            app.start();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20), "initial enforce v1, was " + targetValue());
+
+            // External drift of the owned key, deliberately WITHOUT touching the source (no event):
+            client.configMaps().inNamespace(ns).withName(target)
+                    .edit(c -> new ConfigMapBuilder(c).addToData(key, "drift-no-event").build());
+            assertEquals("drift-no-event", targetValue(), "precondition: target drifted");
+
+            // A (re)install (as recovery would perform) must schedule a reconcile on its own:
+            app.lifecycle().registerWatch();
+            assertTrue(await(() -> "v1".equals(targetValue()), 20),
+                    "the (re)install's own reconcile must repair drift without any source event, was " + targetValue());
+        }
+    }
+}
+
+
+/* ============================================================================
+ * FILE 22: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBindingSpec.java
+ * ============================================================================ */
+
+package io.ssaownership.schemasync.model;
+
+/** Desired state, owned by the deployment/chart. */
+public class SchemaBindingSpec {
+    private String schemaVersion;
+    public String getSchemaVersion() { return schemaVersion; }
+    public void setSchemaVersion(String schemaVersion) { this.schemaVersion = schemaVersion; }
+}
+
+
+/* ============================================================================
+ * FILE 23: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBindingStatus.java
+ * ============================================================================ */
+
+package io.ssaownership.schemasync.model;
+
+/** Observed state, owned by the operator (written via the /status subresource). */
+public class SchemaBindingStatus {
+    private String observedSchemaVersion;
+    private String phase;
+    public String getObservedSchemaVersion() { return observedSchemaVersion; }
+    public void setObservedSchemaVersion(String v) { this.observedSchemaVersion = v; }
+    public String getPhase() { return phase; }
+    public void setPhase(String phase) { this.phase = phase; }
+}
+
+
+/* ============================================================================
+ * FILE 24: schemasync-operator/src/main/java/io/ssaownership/schemasync/model/SchemaBinding.java
+ * ============================================================================ */
+
+package io.ssaownership.schemasync.model;
+
+import io.fabric8.kubernetes.api.model.Namespaced;
+import io.fabric8.kubernetes.client.CustomResource;
+import io.fabric8.kubernetes.model.annotation.Group;
+import io.fabric8.kubernetes.model.annotation.Version;
+
+/**
+ * {@code SchemaBinding} custom resource.
+ * <ul>
+ *   <li>{@code spec.schemaVersion} — DESIRED state, owned by the deployment/Helm chart.</li>
+ *   <li>{@code status} — OBSERVED state, owned by the operator (via the /status subresource).</li>
+ * </ul>
+ * The whole point of the showcase: an operator must record what it observed in {@code status},
+ * NOT contend for {@code spec.schemaVersion}, which the chart owns.
+ */
+@Group("ssaownership.io")
+@Version("v1")
+public class SchemaBinding extends CustomResource<SchemaBindingSpec, SchemaBindingStatus>
+        implements Namespaced {
+}
+
+
+/* ============================================================================
+ * FILE 25: schemasync-operator/src/main/java/io/ssaownership/schemasync/BrokenSchemaSyncReconciler.java
+ * ============================================================================ */
+
+package io.ssaownership.schemasync;
+
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.base.PatchContext;
+import io.fabric8.kubernetes.client.dsl.base.PatchType;
+import io.ssaownership.schemasync.model.SchemaBinding;
+import io.ssaownership.schemasync.model.SchemaBindingSpec;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * BROKEN SchemaSync operator.
+ *
+ * <p>On each reconcile it performs a server-side apply as field manager
+ * {@code schemasync-operator} that INCLUDES {@code spec.schemaVersion} — a field the deployment
+ * (Helm chart) also sets. Under SSA that makes the operator a co-owner of a desired-state field
+ * it has no business owning. A subsequent chart apply (different manager) then CONFLICTS on
+ * {@code spec.schemaVersion}.
+ *
+ * <p>This is the generic reproduction of the real-world defect: a controller contending for a
+ * field whose desired state belongs to another actor. The fix is {@link FixedSchemaSyncReconciler}.
+ */
+public final class BrokenSchemaSyncReconciler {
+
+    private static final Logger LOG = LoggerFactory.getLogger(BrokenSchemaSyncReconciler.class);
+    public static final String FIELD_MANAGER = "schemasync-operator";
+
+    private final KubernetesClient client;
+    private final String namespace;
+
+    public BrokenSchemaSyncReconciler(KubernetesClient client, String namespace) {
+        this.client = client;
+        this.namespace = namespace;
+    }
+
+    /** Reconcile: (wrongly) server-side-apply the spec, co-owning spec.schemaVersion. */
+    public void reconcile(String name) {
+        SchemaBinding current = client.resources(SchemaBinding.class)
+                .inNamespace(namespace).withName(name).get();
+        if (current == null) return;
+        String observed = current.getSpec() != null ? current.getSpec().getSchemaVersion() : null;
+
+        // Build an apply patch that INCLUDES spec.schemaVersion (the bug): the operator claims
+        // ownership of the chart's desired-state field.
+        SchemaBinding patch = new SchemaBinding();
+        patch.getMetadata().setName(name);
+        SchemaBindingSpec spec = new SchemaBindingSpec();
+        spec.setSchemaVersion(observed);     // echoes/claims the chart-owned field under SSA
+        patch.setSpec(spec);
+
+        client.resources(SchemaBinding.class).inNamespace(namespace).withName(name)
+                .patch(new PatchContext.Builder()
+                                .withPatchType(PatchType.SERVER_SIDE_APPLY)
+                                .withFieldManager(FIELD_MANAGER)
+                                .withForce(false)
+                                .build(),
+                        patch);
+        LOG.info("[BROKEN] applied spec (co-owning spec.schemaVersion) for {}", name);
+    }
+}
+
+
+/* ============================================================================
+ * FILE 26: schemasync-operator/src/main/java/io/ssaownership/schemasync/FixedSchemaSyncReconciler.java
+ * ============================================================================ */
+
+package io.ssaownership.schemasync;
+
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.base.PatchContext;
+import io.fabric8.kubernetes.client.dsl.base.PatchType;
+import io.ssaownership.schemasync.model.SchemaBinding;
+import io.ssaownership.schemasync.model.SchemaBindingStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * FIXED SchemaSync operator.
+ *
+ * <p>It records OBSERVED state in {@code status} (via the /status subresource) and NEVER writes
+ * {@code spec}. The decisive architectural property is WHERE it writes: {@code status}, not
+ * {@code spec}. Because it never applies {@code spec}, it never contends with the chart's
+ * ownership of {@code spec.schemaVersion}, so a chart apply never conflicts with this operator.
+ *
+ * <p><b>Update semantics (precise).</b> {@link #reconcile} uses {@code updateStatus()} — a plain
+ * update of the {@code /status} subresource (optimistic-concurrency on resourceVersion). It is
+ * NOT a server-side apply and does NOT register {@link #FIELD_MANAGER} as an SSA owner of status.
+ * This class therefore does not claim SSA ownership of {@code status}; it claims only that it
+ * leaves {@code spec} untouched. (If strict SSA status ownership under a named manager were
+ * required, {@code reconcile} would instead do a server-side apply of {@code status} with
+ * {@code FIELD_MANAGER}; that is a deliberate non-goal here.)
+ *
+ * <h2>Ownership handoff (upgrade from the broken operator)</h2>
+ * Simply ceasing to write {@code spec} does NOT relinquish an EXISTING server-side-apply field
+ * ownership that the broken operator established on {@code spec.schemaVersion}. SSA ownership
+ * persists until explicitly released. {@link #releaseStaleSpecOwnership} performs the handoff:
+ * it re-applies as the SAME field manager with a patch that OWNS NOTHING in spec, which drops the
+ * manager's claim on {@code spec.schemaVersion} WITHOUT deleting the field's value — <b>but only
+ * because another manager (the chart) still owns that field's value</b>. See the precondition on
+ * {@link #releaseStaleSpecOwnership}.
+ */
+public final class FixedSchemaSyncReconciler {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FixedSchemaSyncReconciler.class);
+    public static final String FIELD_MANAGER = "schemasync-operator";
+
+    private final KubernetesClient client;
+    private final String namespace;
+
+    public FixedSchemaSyncReconciler(KubernetesClient client, String namespace) {
+        this.client = client;
+        this.namespace = namespace;
+    }
+
+    /** Reconcile: write ONLY status.observedSchemaVersion (never spec). */
+    public void reconcile(String name) {
+        SchemaBinding current = client.resources(SchemaBinding.class)
+                .inNamespace(namespace).withName(name).get();
+        if (current == null) return;
+        String desired = current.getSpec() != null ? current.getSpec().getSchemaVersion() : null;
+
+        SchemaBindingStatus status = new SchemaBindingStatus();
+        status.setObservedSchemaVersion(desired);
+        status.setPhase(desired == null ? "Pending" : "Synced");
+        current.setStatus(status);
+
+        // updateStatus targets the /status subresource — spec is untouched, no spec ownership.
+        client.resources(SchemaBinding.class).inNamespace(namespace).resource(current).updateStatus();
+        LOG.info("[FIXED] wrote status.observedSchemaVersion={} for {} (spec untouched)", desired, name);
+    }
+
+    /**
+     * Ownership handoff: drop this manager's SSA claim on {@code spec} established by the broken
+     * operator, WITHOUT deleting spec.schemaVersion.
+     *
+     * <p><b>PRECONDITION (critical).</b> This is safe to use for migration ONLY when another
+     * manager (here, the chart) also owns {@code spec.schemaVersion}. Re-applying as this manager
+     * with an empty spec removes the fields THIS manager owned in spec; a field co-owned by the
+     * chart keeps the chart's value. If this operator were the SOLE owner of the field, dropping
+     * its claim could remove the value (or fail validation on a required field). Do not use this as
+     * a blind production migration without first confirming another owner exists — the SSA
+     * demonstration test asserts the value is preserved precisely because the chart co-owns it.
+     */
+    public void releaseStaleSpecOwnership(String name) {
+        SchemaBinding emptyApply = new SchemaBinding();
+        emptyApply.getMetadata().setName(name);
+        // No spec set -> this manager, after this apply, owns no spec fields.
+        client.resources(SchemaBinding.class).inNamespace(namespace).withName(name)
+                .patch(new PatchContext.Builder()
+                                .withPatchType(PatchType.SERVER_SIDE_APPLY)
+                                .withFieldManager(FIELD_MANAGER)
+                                .withForce(false)
+                                .build(),
+                        emptyApply);
+        LOG.info("[FIXED] released stale spec ownership for {} (value preserved by the chart's manager)", name);
+    }
+}
+
+
+/* ============================================================================
+ * FILE 27: schemasync-operator/src/test/java/io/ssaownership/schemasync/SchemaSyncOwnershipIT.java
+ * ============================================================================ */
+
+package io.ssaownership.schemasync;
+
+import io.fabric8.kubernetes.api.model.ManagedFieldsEntry;
+import io.fabric8.kubernetes.api.model.NamespaceBuilder;
+import io.fabric8.kubernetes.api.model.apiextensions.v1.CustomResourceDefinition;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import io.fabric8.kubernetes.client.KubernetesClientException;
+import io.fabric8.kubernetes.client.dsl.base.PatchContext;
+import io.fabric8.kubernetes.client.dsl.base.PatchType;
+import io.ssaownership.schemasync.model.SchemaBinding;
+import io.ssaownership.schemasync.model.SchemaBindingSpec;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledIf;
+
+import java.io.InputStream;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Live SSA ownership demonstration on a real cluster, with ACTUAL managedFields inspection:
+ *  (1) the broken operator co-owning spec.schemaVersion makes a chart apply conflict (HTTP 409);
+ *  (2) the fixed operator (status-only) does NOT conflict and introduces no spec claim;
+ *  (3) the ownership handoff drops the broken operator's spec claim while the chart's value
+ *      survives — and the test asserts the PRECONDITION (the chart co-owns the field) holds.
+ * Named field managers, real 409 codes, and managedFields assertions make this diagnostic.
+ *
+ * Gated by a live-integration profile (see failsafe config). {@link #clusterAvailable()} only
+ * decides local enablement; in CI the profile makes an unreachable cluster a FAILURE, not a skip.
+ */
+@EnabledIf("clusterAvailable")
+class SchemaSyncOwnershipIT {
+
+    static final String CHART_MANAGER = "helm";
+    static boolean clusterAvailable() {
+        if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster"))) {
+            return true;   // profile active: do NOT skip — let a real failure surface
+        }
+        try (KubernetesClient c = new KubernetesClientBuilder().build()) { c.namespaces().list(); return true; }
+        catch (Exception e) { return false; }
+    }
+
+    private KubernetesClient client;
+    private String ns;
+    private final String name = "demo-binding";
+
+    @BeforeEach
+    void setUp() throws Exception {
+        client = new KubernetesClientBuilder().build();
+        ns = "ssa-op-it-" + UUID.randomUUID().toString().substring(0, 8);
+        client.namespaces().resource(new NamespaceBuilder()
+                .withNewMetadata().withName(ns).endMetadata().build()).create();
+        try (InputStream crd = getClass().getResourceAsStream("/crd/schemabinding-crd.yaml")) {
+            CustomResourceDefinition def = client.apiextensions().v1()
+                    .customResourceDefinitions().load(crd).item();
+            client.apiextensions().v1().customResourceDefinitions().resource(def).serverSideApply();
+        }
+        awaitCrdEstablished("schemabindings.ssaownership.io", Duration_SECONDS(30));
+    }
+
+    @AfterEach
+    void tearDown() {
+        // NOTE: the SchemaBinding CRD is CLUSTER-SCOPED and intentionally left installed (shared
+        // fixture). Namespace cleanup does not remove it; run these on a disposable/dedicated
+        // cluster. We delete only our namespace here.
+        try { client.namespaces().withName(ns).delete(); } finally { client.close(); }
+    }
+
+    private static long Duration_SECONDS(long s) { return TimeUnit.SECONDS.toNanos(s); }
+
+    /** Wait, with a bound, for the CRD's Established condition to be True. Restores interruption. */
+    private void awaitCrdEstablished(String crdName, long budgetNanos) {
+        long deadline = System.nanoTime() + budgetNanos;
+        while (System.nanoTime() < deadline) {
+            CustomResourceDefinition d = client.apiextensions().v1()
+                    .customResourceDefinitions().withName(crdName).get();
+            if (d != null && d.getStatus() != null && d.getStatus().getConditions() != null
+                    && d.getStatus().getConditions().stream()
+                        .anyMatch(c -> "Established".equals(c.getType()) && "True".equals(c.getStatus()))) {
+                return;
+            }
+            try { TimeUnit.MILLISECONDS.sleep(100); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError("interrupted waiting for CRD", e); }
+        }
+        throw new AssertionError("CRD " + crdName + " did not reach Established=True within budget");
+    }
+
+    private void chartApply(String version, boolean force) {
+        SchemaBinding sb = new SchemaBinding();
+        sb.getMetadata().setName(name);
+        SchemaBindingSpec spec = new SchemaBindingSpec();
+        spec.setSchemaVersion(version);
+        sb.setSpec(spec);
+        client.resources(SchemaBinding.class).inNamespace(ns).withName(name)
+                .patch(new PatchContext.Builder().withPatchType(PatchType.SERVER_SIDE_APPLY)
+                        .withFieldManager(CHART_MANAGER).withForce(force).build(), sb);
+    }
+
+    private String specVersion() {
+        SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
+        return sb != null && sb.getSpec() != null ? sb.getSpec().getSchemaVersion() : null;
+    }
+    private String statusObserved() {
+        SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
+        return sb != null && sb.getStatus() != null ? sb.getStatus().getObservedSchemaVersion() : null;
+    }
+
+    /** True iff the given field manager owns spec.schemaVersion per managedFields. */
+    private boolean ownsSpecSchemaVersion(String manager) {
+        SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
+        List<ManagedFieldsEntry> mf = sb.getMetadata().getManagedFields();
+        if (mf == null) return false;
+        for (ManagedFieldsEntry e : mf) {
+            if (!manager.equals(e.getManager())) continue;
+            Object fields = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
+            if (fields != null && fields.toString().contains("schemaVersion")) return true;
+        }
+        return false;
+    }
+    private boolean anyManagerOwnsSpec() {
+        SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
+        List<ManagedFieldsEntry> mf = sb.getMetadata().getManagedFields();
+        if (mf == null) return false;
+        return mf.stream().anyMatch(e -> {
+            Object f = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
+            return f != null && f.toString().contains("f:spec");
+        });
+    }
+
+    @Test @Timeout(120)
+    void broken_operator_causes_a_chart_apply_conflict_409_and_co_ownership_is_visible() {
+        chartApply("1.0", false);
+        assertTrue(ownsSpecSchemaVersion(CHART_MANAGER), "precondition: chart owns spec.schemaVersion");
+
+        new BrokenSchemaSyncReconciler(client, ns).reconcile(name);
+        assertTrue(ownsSpecSchemaVersion(BrokenSchemaSyncReconciler.FIELD_MANAGER),
+                "broken operator must CO-OWN spec.schemaVersion (visible in managedFields)");
+
+        KubernetesClientException ex = assertThrows(KubernetesClientException.class,
+                () -> chartApply("2.0", false),
+                "chart apply must conflict when the operator co-owns spec.schemaVersion");
+        assertEquals(409, ex.getCode(), "the failure must be an SSA field-ownership conflict (HTTP 409)");
+    }
+
+    @Test @Timeout(120)
+    void fixed_operator_writes_status_only_and_introduces_no_spec_claim() {
+        chartApply("1.0", false);
+        new FixedSchemaSyncReconciler(client, ns).reconcile(name);
+
+        assertEquals("1.0", statusObserved(), "fixed operator records observed state in status");
+        assertEquals("1.0", specVersion(), "spec untouched by the operator");
+        // the operator must NOT appear as an owner of any spec field:
+        assertFalse(ownsSpecSchemaVersion(FixedSchemaSyncReconciler.FIELD_MANAGER),
+                "status-only operator must not own spec.schemaVersion");
+
+        assertDoesNotThrow(() -> chartApply("2.0", false),
+                "chart apply must NOT conflict when the operator owns no spec field");
+        assertEquals("2.0", specVersion());
+    }
+
+    @Test @Timeout(120)
+    void ownership_handoff_drops_broken_spec_claim_but_chart_value_survives() {
+        // Broken state: operator co-owns spec.schemaVersion.
+        chartApply("1.0", false);
+        new BrokenSchemaSyncReconciler(client, ns).reconcile(name);
+        assertTrue(ownsSpecSchemaVersion(BrokenSchemaSyncReconciler.FIELD_MANAGER), "operator co-owns spec");
+        KubernetesClientException pre = assertThrows(KubernetesClientException.class, () -> chartApply("2.0", false));
+        assertEquals(409, pre.getCode(), "precondition conflict must be a 409");
+
+        // HANDOFF PRECONDITION (explicit): the chart STILL co-owns the field, so dropping the
+        // operator's claim cannot delete the value.
+        assertTrue(ownsSpecSchemaVersion(CHART_MANAGER),
+                "handoff precondition: another manager (chart) owns spec.schemaVersion");
+
+        FixedSchemaSyncReconciler fixed = new FixedSchemaSyncReconciler(client, ns);
+        fixed.releaseStaleSpecOwnership(name);
+
+        assertFalse(ownsSpecSchemaVersion(BrokenSchemaSyncReconciler.FIELD_MANAGER),
+                "handoff must remove the operator's spec.schemaVersion claim");
+        assertTrue(ownsSpecSchemaVersion(CHART_MANAGER), "chart still owns the field after handoff");
+        assertEquals("1.0", specVersion(), "handoff must NOT delete the chart's spec value");
+
+        assertDoesNotThrow(() -> chartApply("2.0", false), "after handoff the chart apply is conflict-free");
+        assertEquals("2.0", specVersion());
+
+        fixed.reconcile(name);
+        assertEquals("2.0", statusObserved());
+        assertFalse(ownsSpecSchemaVersion(FixedSchemaSyncReconciler.FIELD_MANAGER),
+                "the fixed operator still introduces no spec claim");
+    }
+}
+

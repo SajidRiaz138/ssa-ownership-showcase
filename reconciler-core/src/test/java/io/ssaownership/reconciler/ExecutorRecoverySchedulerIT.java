@@ -85,19 +85,20 @@ class ExecutorRecoverySchedulerIT {
     void owning_scheduler_shuts_down_its_own_executor_on_close() throws Exception {
         // createOwning() OWNS its executor; close() must shut that executor down (and then reject
         // further scheduling). Contrast with the shared-executor test above, where close() is a
-        // no-op. This closes the previously STRUCT-only ownership gap with a direct assertion.
-        ExecutorRecoveryScheduler s = ExecutorRecoveryScheduler.createOwning("owned-test");
-        CountDownLatch ran = new CountDownLatch(1);
-        s.schedule(Duration.ofMillis(1), ran::countDown);
-        assertTrue(ran.await(5, TimeUnit.SECONDS), "owned scheduler runs tasks before close");
+        // no-op. try-with-resources guarantees cleanup even if an assertion fails before the
+        // explicit close; a second close() is a harmless no-op (executor already shut down).
+        try (ExecutorRecoveryScheduler s = ExecutorRecoveryScheduler.createOwning("owned-test")) {
+            CountDownLatch ran = new CountDownLatch(1);
+            s.schedule(Duration.ofMillis(1), ran::countDown);
+            assertTrue(ran.await(5, TimeUnit.SECONDS), "owned scheduler runs tasks before close");
 
-        s.close();                                        // must shut down the OWNED executor
+            s.close();                                    // must shut down the OWNED executor
 
-        // After close, scheduling must be rejected because the owned executor is shut down.
-        RejectedExecutionException ex = assertThrows(RejectedExecutionException.class,
-                () -> s.schedule(Duration.ofMillis(1), () -> {}),
-                "an owned scheduler must reject scheduling after close() shuts its executor down");
-        assertNotNull(ex);
+            // After close, scheduling must be rejected because the owned executor is shut down.
+            assertThrows(RejectedExecutionException.class,
+                    () -> s.schedule(Duration.ofMillis(1), () -> {}),
+                    "an owned scheduler must reject scheduling after close() shuts its executor down");
+        }
     }
 
     @Test @Timeout(10)

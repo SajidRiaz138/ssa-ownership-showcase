@@ -34,14 +34,18 @@ All tests, by class (surefire = unit, failsafe = `*IT` integration):
 
 | Class | Kind | Tests |
 |---|---|---|
-| `WatchLifecycleTest` | unit | 23 |
+| `WatchLifecycleTest` | unit | 24 |
 | `ReconcilerTest` | unit | 15 |
 | `ExecutorRecoverySchedulerTest` | unit | 4 |
 | `ExecutorRecoverySchedulerIT` | IT | 6 |
-| `ConfigReconcilerAppIT` | IT (cluster) | 2 |
-| `KubeConfigMapStoreIT` | IT (cluster) | 6 |
+| `ReconcileCoordinatorTest` | unit | 4 |
+| `ConfigReconcilerAppWatchLeakTest` | unit | 3 |
+| `ConfigReconcilerAppIT` | IT (cluster) | 3 |
+| `KubeConfigMapStoreIT` | IT (cluster) | 10 |
 | `SchemaSyncOwnershipIT` | IT (cluster) | 3 |
-| **Total** | | **59** |
+| **Total** | | **72** |
+
+> Count is from the committed revision's failsafe/surefire reports under `-Plive-it`.
 
 Evidence classes (see ADR-0002 for the per-invariant map): **DEMO** = demonstrated by executed
 mutation (2 of them, below); **BEHAV** = deterministic current-behaviour; **STRUCT** = source
@@ -51,15 +55,18 @@ review. Only the two mutation rows are DEMO.
 
 ## Part C — executed verification (captured output)
 
-### C.1 Full reactor build (minikube k8s 1.30)
+### C.1 Full reactor build (minikube k8s 1.30, mandatory `-Plive-it`)
 
 ```
-reconciler-core  : WatchLifecycleTest 23, ReconcilerTest 15, ExecutorRecoverySchedulerTest 4   (unit)
-                   ExecutorRecoverySchedulerIT 6                                                (IT)
-config-reconciler: ConfigReconcilerAppIT 2, KubeConfigMapStoreIT 6                             (IT, cluster)
-schemasync-operator: SchemaSyncOwnershipIT 3                                                   (IT, cluster)
-Reactor: reconciler-core SUCCESS, config-reconciler SUCCESS, schemasync-operator SUCCESS
-BUILD SUCCESS   (59 tests, 0 failures, 0 errors, 0 skipped)
+./mvnw clean verify -Plive-it     # ITs must run; an unreachable cluster FAILS (no silent skip)
+
+reconciler-core  : WatchLifecycleTest 24, ReconcilerTest 15, ExecutorRecoverySchedulerTest 4  (unit)
+                   ExecutorRecoverySchedulerIT 6                                               (IT)
+config-reconciler: ReconcileCoordinatorTest 4, ConfigReconcilerAppWatchLeakTest 3             (unit)
+                   ConfigReconcilerAppIT 3, KubeConfigMapStoreIT 10                            (IT, cluster)
+schemasync-operator: SchemaSyncOwnershipIT 3                                                  (IT, cluster)
+Reactor: all SUCCESS
+BUILD SUCCESS   (72 tests, 0 failures, 0 errors, 0 skipped)
 ```
 
 ### C.2 Mutation 1 — no-op `cancel()` (ExecutorRecoveryScheduler)

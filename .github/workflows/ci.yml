@@ -37,9 +37,22 @@ jobs:
           cluster_name: ssa-ci
       - name: Verify cluster
         run: kubectl get nodes
-      # failsafe ITs are @EnabledIf(clusterAvailable); kind provides the cluster via default kubeconfig.
-      - name: Build + integration tests (unit + *IT)
-        run: ./mvnw -B verify
+      # failsafe ITs under the live-it profile are MANDATORY: an unreachable cluster or broken
+      # credentials FAIL the build rather than silently skipping.
+      - name: Build + integration tests (mandatory live-it)
+        run: ./mvnw -B verify -Plive-it
+      - name: Assert the expected IT classes executed (no silent skips)
+        if: always()
+        run: |
+          set -e
+          expected="ExecutorRecoverySchedulerIT KubeConfigMapStoreIT ConfigReconcilerAppIT SchemaSyncOwnershipIT"
+          for c in $expected; do
+            report=$(find . -path '*/failsafe-reports/*'"$c"'.txt' | head -1)
+            test -n "$report" || { echo "MISSING failsafe report for $c"; exit 1; }
+            grep -q 'Tests run: [1-9]' "$report" || { echo "$c ran zero tests"; exit 1; }
+            grep -qE 'Skipped: [1-9]' "$report" && { echo "$c has unexpected skips"; exit 1; }
+            echo "OK $c: $(grep 'Tests run' "$report" | head -1)"
+          done
       - name: Upload surefire/failsafe reports
         if: always()
         uses: actions/upload-artifact@v4
