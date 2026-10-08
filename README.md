@@ -52,7 +52,11 @@ Maven wrapper is committed.
 ```
 ./mvnw verify                 # unit + integration (ITs auto-skip if no cluster)
 ./mvnw -DskipITs=true test    # unit tests only
+./mvnw clean verify -Plive-it # MANDATORY integration run: fails (not skips) if no cluster
 ```
+
+**Full step-by-step guide to stand up a cluster, verify, deploy, and run the SSA demos:
+[`docs/RUNNING.md`](docs/RUNNING.md).**
 
 ## Architecture & decisions
 - `docs/ARCHITECTURE.md` — components, the ownership model, runtime data flow, lifecycle & shutdown.
