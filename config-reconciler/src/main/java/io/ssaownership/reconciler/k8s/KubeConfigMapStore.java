@@ -30,7 +30,8 @@ import java.util.Optional;
  * server-side-apply field manager for the key. Named SSA field ownership is demonstrated by the
  * SchemaBinding operator scenario, not by this adapter.
  */
-public final class KubeConfigMapStore implements ConfigMapStore {
+public final class KubeConfigMapStore implements ConfigMapStore
+{
 
     private static final Logger LOG = LoggerFactory.getLogger(KubeConfigMapStore.class);
 
@@ -41,17 +42,24 @@ public final class KubeConfigMapStore implements ConfigMapStore {
      *  production; a test injects a concurrent insert here to exercise the conflict path. */
     private final Runnable beforeConditionalWrite;
 
-    public KubeConfigMapStore(KubernetesClient client, String namespace) {
+    public KubeConfigMapStore(KubernetesClient client, String namespace)
+    {
         this(client, namespace, 5);
     }
 
-    public KubeConfigMapStore(KubernetesClient client, String namespace, int maxConflictRetries) {
-        this(client, namespace, maxConflictRetries, () -> {});
+    public KubeConfigMapStore(KubernetesClient client, String namespace, int maxConflictRetries)
+    {
+        this(client, namespace, maxConflictRetries, () ->
+        {
+        });
     }
 
     /** Package-private: adds the pre-write test seam. */
-    KubeConfigMapStore(KubernetesClient client, String namespace, int maxConflictRetries,
-                       Runnable beforeConditionalWrite) {
+    KubeConfigMapStore(KubernetesClient client,
+                       String namespace,
+                       int maxConflictRetries,
+                       Runnable beforeConditionalWrite)
+    {
         this.client = Objects.requireNonNull(client, "client");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
         if (maxConflictRetries < 0) throw new IllegalArgumentException("maxConflictRetries < 0");
@@ -60,66 +68,86 @@ public final class KubeConfigMapStore implements ConfigMapStore {
     }
 
     @Override
-    public Optional<String> get(String configMap, String key) {
+    public Optional<String> get(String configMap, String key)
+    {
         requireName(configMap, "configMap");
         requireName(key, "key");
         final ConfigMap cm;
-        try {
+        try
+        {
             cm = client.configMaps().inNamespace(namespace).withName(configMap).get();
-        } catch (KubernetesClientException e) {
-            throw new StoreException("get " + configMap + " failed", e);   // NOT mapped to empty
         }
-        if (cm == null || cm.getData() == null) {
-            return Optional.empty();            // ConfigMap or key absent
+        catch (KubernetesClientException e)
+        {
+            throw new StoreException("get " + configMap + " failed", e); // NOT mapped to empty
         }
-        return Optional.ofNullable(cm.getData().get(key));   // present "" -> Optional.of("")
+        if (cm == null || cm.getData() == null)
+        {
+            return Optional.empty(); // ConfigMap or key absent
+        }
+        return Optional.ofNullable(cm.getData().get(key)); // present "" -> Optional.of("")
     }
 
     @Override
-    public void upsert(String configMap, String key, String value) {
+    public void upsert(String configMap, String key, String value)
+    {
         requireName(configMap, "configMap");
         requireName(key, "key");
         Objects.requireNonNull(value, "value");
-        try {
-            ConfigMap cm = require(configMap);  // must exist (do not create)
+        try
+        {
+            ConfigMap cm = require(configMap); // must exist (do not create)
             Map<String, String> data = cm.getData() == null ? new HashMap<>() : new HashMap<>(cm.getData());
             data.put(key, value);
             cm.setData(data);
             // replace at the observed resourceVersion (cm carries it) -> optimistic concurrency
             client.configMaps().inNamespace(namespace).resource(cm).update();
-        } catch (KubernetesClientException e) {
+        }
+        catch (KubernetesClientException e)
+        {
             throw new StoreException("upsert " + configMap + "." + key + " failed", e);
         }
     }
 
     @Override
-    public boolean putIfAbsent(String configMap, String key, String value) {
+    public boolean putIfAbsent(String configMap, String key, String value)
+    {
         requireName(configMap, "configMap");
         requireName(key, "key");
         Objects.requireNonNull(value, "value");
         KubernetesClientException last = null;
-        for (int attempt = 0; attempt <= maxConflictRetries; attempt++) {
+        for (int attempt = 0; attempt <= maxConflictRetries; attempt++)
+        {
             ConfigMap cm;
-            try {
+            try
+            {
                 cm = require(configMap);
-            } catch (KubernetesClientException e) {
+            }
+            catch (KubernetesClientException e)
+            {
                 throw new StoreException("putIfAbsent read " + configMap + " failed", e);
             }
             Map<String, String> data = cm.getData();
-            if (data != null && data.containsKey(key)) {
-                return false;                   // present -> preserve, done
+            if (data != null && data.containsKey(key))
+            {
+                return false; // present -> preserve, done
             }
             Map<String, String> next = data == null ? new HashMap<>() : new HashMap<>(data);
             next.put(key, value);
             cm.setData(next);
-            if (attempt == 0) {
-                beforeConditionalWrite.run();   // TEST SEAM: inject a concurrent insert here
+            if (attempt == 0)
+            {
+                beforeConditionalWrite.run(); // TEST SEAM: inject a concurrent insert here
             }
-            try {
-                client.configMaps().inNamespace(namespace).resource(cm).update();  // at observed rv
+            try
+            {
+                client.configMaps().inNamespace(namespace).resource(cm).update(); // at observed rv
                 return true;
-            } catch (KubernetesClientException e) {
-                if (e.getCode() == 409) {       // conflict: someone else wrote; re-read & re-evaluate
+            }
+            catch (KubernetesClientException e)
+            {
+                if (e.getCode() == 409)
+                { // conflict: someone else wrote; re-read & re-evaluate
                     last = e;
                     LOG.info("putIfAbsent {}.{} conflict (attempt {}); re-reading", configMap, key, attempt);
                     continue;
@@ -131,14 +159,17 @@ public final class KubeConfigMapStore implements ConfigMapStore {
                 + " exhausted conflict retries", last);
     }
 
-    private static void requireName(String v, String what) {
+    private static void requireName(String v, String what)
+    {
         Objects.requireNonNull(v, what);
         if (v.isBlank()) throw new IllegalArgumentException(what + " must not be blank");
     }
 
-    private ConfigMap require(String configMap) {
+    private ConfigMap require(String configMap)
+    {
         ConfigMap cm = client.configMaps().inNamespace(namespace).withName(configMap).get();
-        if (cm == null) {
+        if (cm == null)
+        {
             throw new StoreException("ConfigMap " + configMap + " does not exist in " + namespace);
         }
         return cm;

@@ -34,7 +34,8 @@ import java.util.function.Supplier;
  *       from the next pass, not from this method.</li>
  * </ul>
  */
-public final class Reconciler {
+public final class Reconciler
+{
 
     private static final Logger LOG = LoggerFactory.getLogger(Reconciler.class);
 
@@ -51,7 +52,8 @@ public final class Reconciler {
                       String key,
                       WriteStrategy strategy,
                       ConfigMapStore store,
-                      Supplier<String> deriveDesired) {
+                      Supplier<String> deriveDesired)
+    {
         this.name = Objects.requireNonNull(name, "name");
         this.targetConfigMap = Objects.requireNonNull(targetConfigMap, "targetConfigMap");
         this.key = Objects.requireNonNull(key, "key");
@@ -61,11 +63,16 @@ public final class Reconciler {
     }
 
     /** Outcome of one reconcile pass — explicit so callers and tests can assert behaviour. */
-    public enum Outcome {
-        /** A write was performed. */                         WROTE,
-        /** UPSERT: destination already equalled desired. */  SKIPPED_IN_SYNC,
-        /** PUT_IF_ABSENT: key already present, preserved. */ SKIPPED_PRESENT,
-        /** Derivation or a store call failed; retryable. */  FAILED
+    public enum Outcome
+    {
+        /** A write was performed. */
+        WROTE,
+        /** UPSERT: destination already equalled desired. */
+        SKIPPED_IN_SYNC,
+        /** PUT_IF_ABSENT: key already present, preserved. */
+        SKIPPED_PRESENT,
+        /** Derivation or a store call failed; retryable. */
+        FAILED
     }
 
     /**
@@ -85,22 +92,30 @@ public final class Reconciler {
      * coordination across instances or pods. Callers should run passes on worker execution
      * (not directly on a watch callback thread) and coalesce repeated triggers.
      */
-    public synchronized Outcome reconcile() {
+    public synchronized Outcome reconcile()
+    {
         final String desired;
-        try {
+        try
+        {
             desired = Objects.requireNonNull(deriveDesired.get(), "derived value must not be null");
-        } catch (RuntimeException e) {
+        }
+        catch (RuntimeException e)
+        {
             LOG.error("[{}] could not derive desired value; no store write attempted for {}.{}",
                     name, targetConfigMap, key, e);
             return Outcome.FAILED;
         }
 
-        try {
-            return switch (strategy) {
+        try
+        {
+            return switch (strategy)
+            {
                 case UPSERT -> upsertEnforce(desired);
                 case PUT_IF_ABSENT -> seedIfAbsent(desired);
             };
-        } catch (RuntimeException e) {   // e.g. ConfigMapStore.StoreException
+        }
+        catch (RuntimeException e)
+        { // e.g. ConfigMapStore.StoreException
             LOG.error("[{}] reconciliation of {}.{} failed (remote outcome unknown); a subsequent pass re-evaluates the configured policy",
                     name, targetConfigMap, key, e);
             return Outcome.FAILED;
@@ -108,9 +123,11 @@ public final class Reconciler {
     }
 
     /** UPSERT: compare desired to OBSERVED destination; write only if they differ. */
-    private Outcome upsertEnforce(String desired) {
-        Optional<String> observed = store.get(targetConfigMap, key);   // may throw -> FAILED
-        if (observed.filter(desired::equals).isPresent()) {
+    private Outcome upsertEnforce(String desired)
+    {
+        Optional<String> observed = store.get(targetConfigMap, key); // may throw -> FAILED
+        if (observed.filter(desired::equals).isPresent())
+        {
             LOG.debug("[{}] {}.{} already in sync; no write", name, targetConfigMap, key);
             return Outcome.SKIPPED_IN_SYNC;
         }
@@ -120,9 +137,11 @@ public final class Reconciler {
     }
 
     /** PUT_IF_ABSENT: concurrency-safe seed; preserve any existing value. No diagnostic read. */
-    private Outcome seedIfAbsent(String desired) {
-        boolean wrote = store.putIfAbsent(targetConfigMap, key, desired);  // may throw -> FAILED
-        if (wrote) {
+    private Outcome seedIfAbsent(String desired)
+    {
+        boolean wrote = store.putIfAbsent(targetConfigMap, key, desired); // may throw -> FAILED
+        if (wrote)
+        {
             LOG.info("[{}] seeded {}.{} (put-if-absent)", name, targetConfigMap, key);
             return Outcome.WROTE;
         }

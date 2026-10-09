@@ -31,11 +31,13 @@ import java.time.Duration;
  *       document their exact supported range.</li>
  * </ul>
  */
-public interface RecoveryScheduler {
+public interface RecoveryScheduler
+{
 
     Cancellable schedule(Duration delay, Runnable task);
 
-    interface Cancellable {
+    interface Cancellable
+    {
         /** Best-effort cancel. A task that has already started may still complete. */
         void cancel();
     }

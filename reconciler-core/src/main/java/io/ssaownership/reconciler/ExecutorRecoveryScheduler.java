@@ -26,24 +26,29 @@ import java.util.concurrent.TimeUnit;
  *   <li>Invalid (negative) delays are rejected with {@link IllegalArgumentException}.</li>
  * </ul>
  */
-public final class ExecutorRecoveryScheduler implements RecoveryScheduler, AutoCloseable {
+public final class ExecutorRecoveryScheduler implements RecoveryScheduler, AutoCloseable
+{
 
     private final ScheduledExecutorService executor;
     private final boolean owned;
 
     /** Use a shared, externally-owned executor; {@link #close()} will NOT shut it down. */
-    public ExecutorRecoveryScheduler(ScheduledExecutorService executor) {
+    public ExecutorRecoveryScheduler(ScheduledExecutorService executor)
+    {
         this(executor, false);
     }
 
-    private ExecutorRecoveryScheduler(ScheduledExecutorService executor, boolean owned) {
+    private ExecutorRecoveryScheduler(ScheduledExecutorService executor, boolean owned)
+    {
         this.executor = Objects.requireNonNull(executor, "executor");
         this.owned = owned;
     }
 
     /** Create a scheduler that OWNS a dedicated single-thread executor, shut down by {@link #close()}. */
-    public static ExecutorRecoveryScheduler createOwning(String threadName) {
-        ScheduledExecutorService ex = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+    public static ExecutorRecoveryScheduler createOwning(String threadName)
+    {
+        ScheduledExecutorService ex = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r ->
+        {
             Thread t = new Thread(r, threadName);
             t.setDaemon(true);
             return t;
@@ -52,10 +57,12 @@ public final class ExecutorRecoveryScheduler implements RecoveryScheduler, AutoC
     }
 
     @Override
-    public Cancellable schedule(Duration delay, Runnable task) {
+    public Cancellable schedule(Duration delay, Runnable task)
+    {
         Objects.requireNonNull(delay, "delay");
         Objects.requireNonNull(task, "task");
-        if (delay.isNegative()) {
+        if (delay.isNegative())
+        {
             throw new IllegalArgumentException("delay must not be negative: " + delay);
         }
         // Accepts nonnegative durations whose toMillis() conversion fits in a long. A positive
@@ -64,23 +71,29 @@ public final class ExecutorRecoveryScheduler implements RecoveryScheduler, AutoC
         // duration upward. Actual scheduling precision and extreme-delay handling depend on the
         // backing executor; conversion overflow is rejected as IllegalArgumentException.
         long millis;
-        try {
+        try
+        {
             millis = delay.toMillis();
-        } catch (ArithmeticException overflow) {
+        }
+        catch (ArithmeticException overflow)
+        {
             throw new IllegalArgumentException("delay too large to represent in millis: " + delay, overflow);
         }
-        if (millis == 0 && !delay.isZero()) {
-            millis = 1;                       // positive sub-ms -> minimum representable, not dropped
+        if (millis == 0 && !delay.isZero())
+        {
+            millis = 1; // positive sub-ms -> minimum representable, not dropped
         }
         // May throw RejectedExecutionException — intentionally propagated to the caller.
         ScheduledFuture<?> future = executor.schedule(task, millis, TimeUnit.MILLISECONDS);
-        return () -> future.cancel(false);   // best-effort; a running task is not interrupted
+        return () -> future.cancel(false); // best-effort; a running task is not interrupted
     }
 
     /** Shuts down the executor ONLY if this scheduler created it. No-op for a shared executor. */
     @Override
-    public void close() {
-        if (owned) {
+    public void close()
+    {
+        if (owned)
+        {
             executor.shutdownNow();
         }
     }

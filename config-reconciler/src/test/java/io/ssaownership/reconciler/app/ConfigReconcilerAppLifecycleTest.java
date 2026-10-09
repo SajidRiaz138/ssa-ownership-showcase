@@ -24,53 +24,68 @@ import static org.junit.jupiter.api.Assertions.*;
  * source review here; the one-time/idempotent GUARANTEES below are what this test pins
  * deterministically.
  */
-class ConfigReconcilerAppLifecycleTest {
+class ConfigReconcilerAppLifecycleTest
+{
 
     private KubernetesClient client;
     private ConfigReconcilerApp app;
 
-    private ConfigReconcilerApp newApp() {
+    private ConfigReconcilerApp newApp()
+    {
         client = new KubernetesClientBuilder().withConfig(new ConfigBuilder()
                 .withMasterUrl("https://127.0.0.1:1")
-                .withConnectionTimeout(300).withRequestTimeout(300)
-                .withWatchReconnectLimit(0).build()).build();
+                .withConnectionTimeout(300)
+                .withRequestTimeout(300)
+                .withWatchReconnectLimit(0)
+                .build()).build();
         app = new ConfigReconcilerApp(client, "ns", "src", "tgt", "key",
                 Duration.ofSeconds(1), Duration.ofMinutes(10));
         return app;
     }
 
     @AfterEach
-    void tearDown() {
+    void tearDown()
+    {
         if (app != null) app.close();
         if (client != null) client.close();
     }
 
-    @Test @Timeout(30)
-    void start_after_close_is_rejected() {
+    @Test
+    @Timeout (30)
+    void start_after_close_is_rejected()
+    {
         newApp();
-        app.close();                                     // NEW -> CLOSED without starting
+        app.close(); // NEW -> CLOSED without starting
         assertThrows(IllegalStateException.class, app::start,
                 "start() after close() must be rejected");
     }
 
-    @Test @Timeout(30)
-    void repeated_close_is_harmless() {
+    @Test
+    @Timeout (30)
+    void repeated_close_is_harmless()
+    {
         newApp();
         assertDoesNotThrow(app::close);
         assertDoesNotThrow(app::close, "a second close() must be a no-op");
         assertDoesNotThrow(app::close, "and a third");
     }
 
-    @Test @Timeout(30)
-    void close_without_start_is_harmless() {
+    @Test
+    @Timeout (30)
+    void close_without_start_is_harmless()
+    {
         newApp();
         assertDoesNotThrow(app::close, "close() on a never-started app must not throw");
     }
 
-    @Test @Timeout(30)
-    void blank_configuration_is_rejected_at_construction() {
+    @Test
+    @Timeout (30)
+    void blank_configuration_is_rejected_at_construction()
+    {
         try (KubernetesClient c = new KubernetesClientBuilder().withConfig(new ConfigBuilder()
-                .withMasterUrl("https://127.0.0.1:1").build()).build()) {
+                .withMasterUrl("https://127.0.0.1:1")
+                .build()).build())
+        {
             assertThrows(IllegalArgumentException.class,
                     () -> new ConfigReconcilerApp(c, " ", "src", "tgt", "key"), "blank namespace");
             assertThrows(IllegalArgumentException.class,

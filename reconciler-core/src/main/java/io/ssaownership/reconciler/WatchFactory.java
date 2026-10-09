@@ -13,7 +13,8 @@ import io.fabric8.kubernetes.client.Watch;
  * for production watches and was deliberately removed.
  */
 @FunctionalInterface
-public interface WatchFactory {
+public interface WatchFactory
+{
     /**
      * Create a watch, having wired its terminal-closure notification to {@code onClosed} BEFORE
      * returning the handle. Contract:

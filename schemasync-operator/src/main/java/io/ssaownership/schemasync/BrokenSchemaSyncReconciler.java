@@ -20,7 +20,8 @@ import org.slf4j.LoggerFactory;
  * <p>This is the generic reproduction of the real-world defect: a controller contending for a
  * field whose desired state belongs to another actor. The fix is {@link FixedSchemaSyncReconciler}.
  */
-public final class BrokenSchemaSyncReconciler {
+public final class BrokenSchemaSyncReconciler
+{
 
     private static final Logger LOG = LoggerFactory.getLogger(BrokenSchemaSyncReconciler.class);
     public static final String FIELD_MANAGER = "schemasync-operator";
@@ -28,16 +29,20 @@ public final class BrokenSchemaSyncReconciler {
     private final KubernetesClient client;
     private final String namespace;
 
-    public BrokenSchemaSyncReconciler(KubernetesClient client, String namespace) {
+    public BrokenSchemaSyncReconciler(KubernetesClient client, String namespace)
+    {
         this.client = java.util.Objects.requireNonNull(client, "client");
         this.namespace = Names.require(namespace, "namespace");
     }
 
     /** Reconcile: (wrongly) server-side-apply the spec, co-owning spec.schemaVersion. */
-    public void reconcile(String name) {
+    public void reconcile(String name)
+    {
         Names.require(name, "name");
         SchemaBinding current = client.resources(SchemaBinding.class)
-                .inNamespace(namespace).withName(name).get();
+                .inNamespace(namespace)
+                .withName(name)
+                .get();
         if (current == null) return;
         String observed = current.getSpec() != null ? current.getSpec().getSchemaVersion() : null;
 
@@ -46,15 +51,17 @@ public final class BrokenSchemaSyncReconciler {
         SchemaBinding patch = new SchemaBinding();
         patch.getMetadata().setName(name);
         SchemaBindingSpec spec = new SchemaBindingSpec();
-        spec.setSchemaVersion(observed);     // echoes/claims the chart-owned field under SSA
+        spec.setSchemaVersion(observed); // echoes/claims the chart-owned field under SSA
         patch.setSpec(spec);
 
-        client.resources(SchemaBinding.class).inNamespace(namespace).withName(name)
+        client.resources(SchemaBinding.class)
+                .inNamespace(namespace)
+                .withName(name)
                 .patch(new PatchContext.Builder()
-                                .withPatchType(PatchType.SERVER_SIDE_APPLY)
-                                .withFieldManager(FIELD_MANAGER)
-                                .withForce(false)
-                                .build(),
+                        .withPatchType(PatchType.SERVER_SIDE_APPLY)
+                        .withFieldManager(FIELD_MANAGER)
+                        .withForce(false)
+                        .build(),
                         patch);
         LOG.info("[BROKEN] applied spec (co-owning spec.schemaVersion) for {}", name);
     }

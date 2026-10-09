@@ -14,8 +14,8 @@ import io.fabric8.kubernetes.model.annotation.Version;
  * The whole point of the showcase: an operator must record what it observed in {@code status},
  * NOT contend for {@code spec.schemaVersion}, which the chart owns.
  */
-@Group("ssaownership.io")
-@Version("v1")
-public class SchemaBinding extends CustomResource<SchemaBindingSpec, SchemaBindingStatus>
-        implements Namespaced {
+@Group ("ssaownership.io")
+@Version ("v1")
+public class SchemaBinding extends CustomResource<SchemaBindingSpec, SchemaBindingStatus> implements Namespaced
+{
 }

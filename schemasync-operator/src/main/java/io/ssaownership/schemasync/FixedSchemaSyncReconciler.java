@@ -33,7 +33,8 @@ import org.slf4j.LoggerFactory;
  * because another manager (the chart) still owns that field's value</b>. See the precondition on
  * {@link #releaseStaleSpecOwnership}.
  */
-public final class FixedSchemaSyncReconciler {
+public final class FixedSchemaSyncReconciler
+{
 
     private static final Logger LOG = LoggerFactory.getLogger(FixedSchemaSyncReconciler.class);
     public static final String FIELD_MANAGER = "schemasync-operator";
@@ -41,16 +42,20 @@ public final class FixedSchemaSyncReconciler {
     private final KubernetesClient client;
     private final String namespace;
 
-    public FixedSchemaSyncReconciler(KubernetesClient client, String namespace) {
+    public FixedSchemaSyncReconciler(KubernetesClient client, String namespace)
+    {
         this.client = java.util.Objects.requireNonNull(client, "client");
         this.namespace = Names.require(namespace, "namespace");
     }
 
     /** Reconcile: write ONLY status.observedSchemaVersion (never spec). */
-    public void reconcile(String name) {
+    public void reconcile(String name)
+    {
         Names.require(name, "name");
         SchemaBinding current = client.resources(SchemaBinding.class)
-                .inNamespace(namespace).withName(name).get();
+                .inNamespace(namespace)
+                .withName(name)
+                .get();
         if (current == null) return;
         String desired = current.getSpec() != null ? current.getSpec().getSchemaVersion() : null;
 
@@ -76,17 +81,20 @@ public final class FixedSchemaSyncReconciler {
      * a blind production migration without first confirming another owner exists — the SSA
      * demonstration test asserts the value is preserved precisely because the chart co-owns it.
      */
-    public void releaseStaleSpecOwnership(String name) {
+    public void releaseStaleSpecOwnership(String name)
+    {
         Names.require(name, "name");
         SchemaBinding emptyApply = new SchemaBinding();
         emptyApply.getMetadata().setName(name);
         // No spec set -> this manager, after this apply, owns no spec fields.
-        client.resources(SchemaBinding.class).inNamespace(namespace).withName(name)
+        client.resources(SchemaBinding.class)
+                .inNamespace(namespace)
+                .withName(name)
                 .patch(new PatchContext.Builder()
-                                .withPatchType(PatchType.SERVER_SIDE_APPLY)
-                                .withFieldManager(FIELD_MANAGER)
-                                .withForce(false)
-                                .build(),
+                        .withPatchType(PatchType.SERVER_SIDE_APPLY)
+                        .withFieldManager(FIELD_MANAGER)
+                        .withForce(false)
+                        .build(),
                         emptyApply);
         LOG.info("[FIXED] released stale spec ownership for {} (value preserved by the chart's manager)", name);
     }

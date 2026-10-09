@@ -48,11 +48,15 @@ import java.util.function.Consumer;
  *       Correctness comes from the token/closed check, not from cancellation.</li>
  * </ul>
  */
-public final class ReconcileCoordinator implements AutoCloseable {
+public final class ReconcileCoordinator implements AutoCloseable
+{
 
     private static final Logger LOG = LoggerFactory.getLogger(ReconcileCoordinator.class);
 
-    private enum State { IDLE, RUNNING, RETRY_PENDING, CLOSED }
+    private enum State
+    {
+        IDLE, RUNNING, RETRY_PENDING, CLOSED
+    }
 
     private final Reconciler reconciler;
     private final ScheduledExecutorService executor;
@@ -64,22 +68,28 @@ public final class ReconcileCoordinator implements AutoCloseable {
 
     private final ReentrantLock lock = new ReentrantLock();
     private State state = State.IDLE;
-    private boolean dirty = false;            // a trigger arrived while RUNNING
-    private long retryToken = 0;              // identifies the current RETRY_PENDING reservation
-    private ScheduledFuture<?> retryHandle;   // the pending retry's handle (guarded)
-    private ScheduledFuture<?> resyncHandle;  // periodic resync handle (guarded)
-    private boolean resyncStarting = false;   // resync startup reserved, scheduling outside lock (guarded)
+    private boolean dirty = false; // a trigger arrived while RUNNING
+    private long retryToken = 0; // identifies the current RETRY_PENDING reservation
+    private ScheduledFuture<?> retryHandle; // the pending retry's handle (guarded)
+    private ScheduledFuture<?> resyncHandle; // periodic resync handle (guarded)
+    private boolean resyncStarting = false; // resync startup reserved, scheduling outside lock (guarded)
 
-    public ReconcileCoordinator(Reconciler reconciler, ScheduledExecutorService executor,
-                                Duration retryDelay, Duration resyncInterval) {
-        this(reconciler, executor, retryDelay, resyncInterval, rej ->
-                LOG.error("reconcile coordinator: unexpected executor rejection while open "
+    public ReconcileCoordinator(Reconciler reconciler,
+                                ScheduledExecutorService executor,
+                                Duration retryDelay,
+                                Duration resyncInterval)
+    {
+        this(reconciler, executor, retryDelay, resyncInterval,
+                rej -> LOG.error("reconcile coordinator: unexpected executor rejection while open "
                         + "(controller is alive but may be inert)", rej));
     }
 
-    public ReconcileCoordinator(Reconciler reconciler, ScheduledExecutorService executor,
-                                Duration retryDelay, Duration resyncInterval,
-                                Consumer<RejectedExecutionException> onUnexpectedRejection) {
+    public ReconcileCoordinator(Reconciler reconciler,
+                                ScheduledExecutorService executor,
+                                Duration retryDelay,
+                                Duration resyncInterval,
+                                Consumer<RejectedExecutionException> onUnexpectedRejection)
+    {
         this.reconciler = Objects.requireNonNull(reconciler, "reconciler");
         this.executor = Objects.requireNonNull(executor, "executor");
         this.onUnexpectedRejection = Objects.requireNonNull(onUnexpectedRejection, "onUnexpectedRejection");
@@ -93,52 +103,72 @@ public final class ReconcileCoordinator implements AutoCloseable {
      * {@code scheduleWithFixedDelay}), and turn conversion overflow into a parameter-named
      * {@link IllegalArgumentException}. Accepted precision is milliseconds.
      */
-    private static long normalizeMillis(Duration d, String param) {
+    private static long normalizeMillis(Duration d, String param)
+    {
         Objects.requireNonNull(d, param);
         if (d.isNegative() || d.isZero()) throw new IllegalArgumentException(param + " must be positive");
         final long ms;
-        try { ms = d.toMillis(); }
-        catch (ArithmeticException overflow) {
+        try
+        {
+            ms = d.toMillis();
+        }
+        catch (ArithmeticException overflow)
+        {
             throw new IllegalArgumentException(param + " too large to represent in milliseconds: " + d, overflow);
         }
-        return Math.max(1, ms);     // positive sub-ms -> 1ms
+        return Math.max(1, ms); // positive sub-ms -> 1ms
     }
 
     /** Start periodic resync. Call once after construction. */
-    public void startPeriodicResync() {
+    public void startPeriodicResync()
+    {
         // Reserve startup under the lock; schedule OUTSIDE the lock (consistent with the rule that
         // infrastructure calls never happen under the coordinator lock); publish the handle only
         // if still current.
         lock.lock();
-        try {
+        try
+        {
             if (state == State.CLOSED || resyncStarting || resyncHandle != null) return;
             resyncStarting = true;
-        } finally {
+        }
+        finally
+        {
             lock.unlock();
         }
 
         ScheduledFuture<?> handle = null;
         RejectedExecutionException rejection = null;
-        try {
+        try
+        {
             handle = executor.scheduleWithFixedDelay(this::trigger,
                     resyncIntervalMs, resyncIntervalMs, TimeUnit.MILLISECONDS);
-        } catch (RejectedExecutionException rej) {
+        }
+        catch (RejectedExecutionException rej)
+        {
             rejection = rej;
         }
 
         ScheduledFuture<?> toCancel = null;
         boolean report = false;
         lock.lock();
-        try {
+        try
+        {
             resyncStarting = false;
-            if (rejection != null) {
+            if (rejection != null)
+            {
                 report = (state != State.CLOSED);
-            } else if (state == State.CLOSED) {
-                toCancel = handle;        // closed while scheduling -> drop the late handle
-            } else {
-                resyncHandle = handle;    // publish
             }
-        } finally {
+            else if (state == State.CLOSED)
+            {
+                toCancel = handle; // closed while scheduling -> drop the late handle
+            }
+            else
+            {
+                resyncHandle = handle; // publish
+            }
+        }
+        finally
+        {
             lock.unlock();
         }
         cancelOutsideLock(toCancel);
@@ -155,62 +185,90 @@ public final class ReconcileCoordinator implements AutoCloseable {
      *       lock), and start an immediate drain instead of waiting out the delay.</li>
      * </ul>
      */
-    public void trigger() {
+    public void trigger()
+    {
         ScheduledFuture<?> toCancel = null;
         boolean submit = false;
         lock.lock();
-        try {
-            switch (state) {
-                case CLOSED -> { return; }
-                case RUNNING -> { dirty = true; return; }
+        try
+        {
+            switch (state)
+            {
+                case CLOSED -> {
+                    return;
+                }
+                case RUNNING -> {
+                    dirty = true;
+                    return;
+                }
                 case RETRY_PENDING -> {
-                    retryToken++;                 // invalidate the pending retry
+                    retryToken++; // invalidate the pending retry
                     toCancel = retryHandle;
                     retryHandle = null;
                     state = State.RUNNING;
                     submit = true;
                 }
-                case IDLE -> { state = State.RUNNING; submit = true; }
+                case IDLE -> {
+                    state = State.RUNNING;
+                    submit = true;
+                }
             }
-        } finally {
+        }
+        finally
+        {
             lock.unlock();
         }
-        cancelOutsideLock(toCancel);              // expedite: drop the delayed retry
+        cancelOutsideLock(toCancel); // expedite: drop the delayed retry
         if (submit) submitDrain();
     }
 
-    private void submitDrain() {
-        try {
+    private void submitDrain()
+    {
+        try
+        {
             executor.execute(this::drain);
-        } catch (RejectedExecutionException rej) {
+        }
+        catch (RejectedExecutionException rej)
+        {
             boolean report;
             lock.lock();
-            try {
+            try
+            {
                 report = (state != State.CLOSED);
-                if (report) {
+                if (report)
+                {
                     state = State.IDLE;
-                    dirty = false;      // the never-submitted work's dirty flag must not leak forward
+                    dirty = false; // the never-submitted work's dirty flag must not leak forward
                 }
-            } finally {
+            }
+            finally
+            {
                 lock.unlock();
             }
             if (report) reportUnexpectedRejection(rej);
         }
     }
 
-    private void drain() {
+    private void drain()
+    {
         // Guard BEFORE touching the engine: a dequeued drain/retry must not reconcile after close.
         lock.lock();
-        try {
+        try
+        {
             if (state == State.CLOSED) return;
-        } finally {
+        }
+        finally
+        {
             lock.unlock();
         }
 
         Reconciler.Outcome outcome;
-        try {
+        try
+        {
             outcome = reconciler.reconcile();
-        } catch (RuntimeException e) {
+        }
+        catch (RuntimeException e)
+        {
             outcome = Reconciler.Outcome.FAILED;
             LOG.error("reconcile pass threw unexpectedly", e);
         }
@@ -219,40 +277,58 @@ public final class ReconcileCoordinator implements AutoCloseable {
         boolean scheduleRetry = false;
         long tokenForRetry = 0;
         lock.lock();
-        try {
+        try
+        {
             if (state == State.CLOSED) return;
-            if (dirty) {
+            if (dirty)
+            {
                 dirty = false;
-                rerunNow = true;                  // coalesced follow-up; stay RUNNING
-            } else if (outcome == Reconciler.Outcome.FAILED) {
+                rerunNow = true; // coalesced follow-up; stay RUNNING
+            }
+            else if (outcome == Reconciler.Outcome.FAILED)
+            {
                 state = State.RETRY_PENDING;
                 tokenForRetry = ++retryToken;
                 scheduleRetry = true;
-            } else {
-                state = State.IDLE;               // settled
             }
-        } finally {
+            else
+            {
+                state = State.IDLE; // settled
+            }
+        }
+        finally
+        {
             lock.unlock();
         }
 
-        if (rerunNow) {
+        if (rerunNow)
+        {
             submitDrain();
-        } else if (scheduleRetry) {
+        }
+        else if (scheduleRetry)
+        {
             scheduleRetry(tokenForRetry);
         }
     }
 
-    private void scheduleRetry(long token) {
+    private void scheduleRetry(long token)
+    {
         final ScheduledFuture<?> handle;
-        try {
+        try
+        {
             handle = executor.schedule(() -> runRetry(token), retryDelayMs, TimeUnit.MILLISECONDS);
-        } catch (RejectedExecutionException rej) {
+        }
+        catch (RejectedExecutionException rej)
+        {
             boolean report;
             lock.lock();
-            try {
+            try
+            {
                 report = (state == State.RETRY_PENDING && retryToken == token);
                 if (report) state = State.IDLE;
-            } finally {
+            }
+            finally
+            {
                 lock.unlock();
             }
             if (report) reportUnexpectedRejection(rej);
@@ -260,34 +336,45 @@ public final class ReconcileCoordinator implements AutoCloseable {
         }
         boolean stale;
         lock.lock();
-        try {
+        try
+        {
             // A trigger/close may have superseded this reservation while we were scheduling.
             stale = (state != State.RETRY_PENDING) || (retryToken != token);
             if (!stale) retryHandle = handle;
-        } finally {
+        }
+        finally
+        {
             lock.unlock();
         }
         if (stale) cancelOutsideLock(handle);
     }
 
     /** The delayed retry body. Runs only if its token is still current AND not closed. */
-    private void runRetry(long token) {
+    private void runRetry(long token)
+    {
         lock.lock();
-        try {
-            if (state != State.RETRY_PENDING || retryToken != token) return;  // superseded/closed
+        try
+        {
+            if (state != State.RETRY_PENDING || retryToken != token) return; // superseded/closed
             state = State.RUNNING;
             retryHandle = null;
-        } finally {
+        }
+        finally
+        {
             lock.unlock();
         }
         drain();
     }
 
     /** Invoke the unexpected-rejection observer OUTSIDE the lock, never letting it escape. */
-    private void reportUnexpectedRejection(RejectedExecutionException rej) {
-        try {
+    private void reportUnexpectedRejection(RejectedExecutionException rej)
+    {
+        try
+        {
             onUnexpectedRejection.accept(rej);
-        } catch (RuntimeException observerFailure) {
+        }
+        catch (RuntimeException observerFailure)
+        {
             LOG.error("unexpected-rejection observer failed", observerFailure);
         }
     }
@@ -305,35 +392,113 @@ public final class ReconcileCoordinator implements AutoCloseable {
      * application cleanup returns.
      */
     @Override
-    public void close() {
+    public void close()
+    {
         ScheduledFuture<?> retry;
         ScheduledFuture<?> resync;
         lock.lock();
-        try {
+        try
+        {
             state = State.CLOSED;
-            retryToken++;                         // invalidate any in-flight retry reservation
-            retry = retryHandle; retryHandle = null;
-            resync = resyncHandle; resyncHandle = null;
-        } finally {
+            retryToken++; // invalidate any in-flight retry reservation
+            retry = retryHandle;
+            retryHandle = null;
+            resync = resyncHandle;
+            resyncHandle = null;
+        }
+        finally
+        {
             lock.unlock();
         }
-        cancelOutsideLock(retry);                 // Invariant: cancel OUTSIDE the lock
+        cancelOutsideLock(retry); // Invariant: cancel OUTSIDE the lock
         cancelOutsideLock(resync);
     }
 
-    private void cancelOutsideLock(ScheduledFuture<?> f) {
-        if (f != null) {
-            try { f.cancel(false); } catch (RuntimeException e) { LOG.warn("cancel error (ignored)", e); }
+    private void cancelOutsideLock(ScheduledFuture<?> f)
+    {
+        if (f != null)
+        {
+            try
+            {
+                f.cancel(false);
+            }
+            catch (RuntimeException e)
+            {
+                LOG.warn("cancel error (ignored)", e);
+            }
         }
     }
 
     // ---- test hooks (package-private) ----
-    boolean debugRunning()      { lock.lock(); try { return state == State.RUNNING; } finally { lock.unlock(); } }
-    boolean debugRetryPending() { lock.lock(); try { return state == State.RETRY_PENDING; } finally { lock.unlock(); } }
-    boolean debugDirty()        { lock.lock(); try { return dirty; } finally { lock.unlock(); } }
-    boolean debugClosed()       { lock.lock(); try { return state == State.CLOSED; } finally { lock.unlock(); } }
-    long debugRetryToken()      { lock.lock(); try { return retryToken; } finally { lock.unlock(); } }
+    boolean debugRunning()
+    {
+        lock.lock();
+        try
+        {
+            return state == State.RUNNING;
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    boolean debugRetryPending()
+    {
+        lock.lock();
+        try
+        {
+            return state == State.RETRY_PENDING;
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    boolean debugDirty()
+    {
+        lock.lock();
+        try
+        {
+            return dirty;
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    boolean debugClosed()
+    {
+        lock.lock();
+        try
+        {
+            return state == State.CLOSED;
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    long debugRetryToken()
+    {
+        lock.lock();
+        try
+        {
+            return retryToken;
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
     /** Invoke the retry body with a given token exactly as the scheduled timer would, so a test
      *  can deterministically run a STALE retry (e.g. after close) and prove it does not reconcile. */
-    void debugRunRetry(long token) { runRetry(token); }
+    void debugRunRetry(long token)
+    {
+        runRetry(token);
+    }
 }

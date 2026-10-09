@@ -27,7 +27,8 @@ package io.ssaownership.reconciler;
  * not a licence to force Kubernetes server-side-apply field-ownership conflicts — SSA ownership
  * is a separate concern handled by the apply mechanism.
  */
-public enum WriteStrategy {
+public enum WriteStrategy
+{
     UPSERT,
     PUT_IF_ABSENT
 }

@@ -35,16 +35,27 @@ import static org.junit.jupiter.api.Assertions.*;
  * Gated by a live-integration profile (see failsafe config). {@link #clusterAvailable()} only
  * decides local enablement; in CI the profile makes an unreachable cluster a FAILURE, not a skip.
  */
-@EnabledIf("clusterAvailable")
-class SchemaSyncOwnershipIT {
+@EnabledIf ("clusterAvailable")
+class SchemaSyncOwnershipIT
+{
 
-    static final String CHART_MANAGER = "chart-ssa-manager";   // models a chart/deployment SSA writer
-    static boolean clusterAvailable() {
-        if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster"))) {
-            return true;   // profile active: do NOT skip — let a real failure surface
+    static final String CHART_MANAGER = "chart-ssa-manager"; // models a chart/deployment SSA writer
+
+    static boolean clusterAvailable()
+    {
+        if ("true".equalsIgnoreCase(System.getProperty("ssa.it.requireCluster")))
+        {
+            return true; // profile active: do NOT skip — let a real failure surface
         }
-        try (KubernetesClient c = new KubernetesClientBuilder().build()) { c.namespaces().list(); return true; }
-        catch (Exception e) { return false; }
+        try (KubernetesClient c = new KubernetesClientBuilder().build())
+        {
+            c.namespaces().list();
+            return true;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
     }
 
     private KubernetesClient client;
@@ -52,17 +63,29 @@ class SchemaSyncOwnershipIT {
     private final String name = "demo-binding";
 
     @BeforeEach
-    void setUp() throws Exception {
+    void setUp() throws Exception
+    {
         client = new KubernetesClientBuilder().build();
         ns = "ssa-op-it-" + UUID.randomUUID().toString().substring(0, 8);
-        client.namespaces().resource(new NamespaceBuilder()
-                .withNewMetadata().withName(ns).endMetadata().build()).create();
-        try (InputStream crd = getClass().getResourceAsStream("/crd/schemabinding-crd.yaml")) {
+        client.namespaces()
+                .resource(new NamespaceBuilder()
+                        .withNewMetadata()
+                        .withName(ns)
+                        .endMetadata()
+                        .build())
+                .create();
+        try (InputStream crd = getClass().getResourceAsStream("/crd/schemabinding-crd.yaml"))
+        {
             Objects.requireNonNull(crd, "missing /crd/schemabinding-crd.yaml on the test classpath");
-            CustomResourceDefinition def = client.apiextensions().v1()
-                    .customResourceDefinitions().load(crd).item();
+            CustomResourceDefinition def = client.apiextensions()
+                    .v1()
+                    .customResourceDefinitions()
+                    .load(crd)
+                    .item();
             // The /status subresource MUST be configured for updateStatus() to target it.
-            boolean statusEnabled = def.getSpec().getVersions().stream()
+            boolean statusEnabled = def.getSpec()
+                    .getVersions()
+                    .stream()
                     .anyMatch(v -> v.getSubresources() != null && v.getSubresources().getStatus() != null);
             assertTrue(statusEnabled, "CRD must enable the status subresource");
             client.apiextensions().v1().customResourceDefinitions().resource(def).serverSideApply();
@@ -71,48 +94,82 @@ class SchemaSyncOwnershipIT {
     }
 
     @AfterEach
-    void tearDown() {
+    void tearDown()
+    {
         // NOTE: the SchemaBinding CRD is CLUSTER-SCOPED and intentionally left installed (shared
         // fixture). Namespace cleanup does not remove it; run these on a disposable/dedicated
         // cluster. We delete only our namespace here.
-        try { client.namespaces().withName(ns).delete(); } finally { client.close(); }
+        try
+        {
+            client.namespaces().withName(ns).delete();
+        }
+        finally
+        {
+            client.close();
+        }
     }
 
-    private static long Duration_SECONDS(long s) { return TimeUnit.SECONDS.toNanos(s); }
+    private static long Duration_SECONDS(long s)
+    {
+        return TimeUnit.SECONDS.toNanos(s);
+    }
 
     /** Wait, with a bound, for the CRD's Established condition to be True. Restores interruption. */
-    private void awaitCrdEstablished(String crdName, long budgetNanos) {
+    private void awaitCrdEstablished(String crdName, long budgetNanos)
+    {
         long deadline = System.nanoTime() + budgetNanos;
-        while (System.nanoTime() < deadline) {
-            CustomResourceDefinition d = client.apiextensions().v1()
-                    .customResourceDefinitions().withName(crdName).get();
+        while (System.nanoTime() < deadline)
+        {
+            CustomResourceDefinition d = client.apiextensions()
+                    .v1()
+                    .customResourceDefinitions()
+                    .withName(crdName)
+                    .get();
             if (d != null && d.getStatus() != null && d.getStatus().getConditions() != null
-                    && d.getStatus().getConditions().stream()
-                        .anyMatch(c -> "Established".equals(c.getType()) && "True".equals(c.getStatus()))) {
+                    && d.getStatus()
+                            .getConditions()
+                            .stream()
+                            .anyMatch(c -> "Established".equals(c.getType()) && "True".equals(c.getStatus())))
+            {
                 return;
             }
-            try { TimeUnit.MILLISECONDS.sleep(100); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError("interrupted waiting for CRD", e); }
+            try
+            {
+                TimeUnit.MILLISECONDS.sleep(100);
+            }
+            catch (InterruptedException e)
+            {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted waiting for CRD", e);
+            }
         }
         throw new AssertionError("CRD " + crdName + " did not reach Established=True within budget");
     }
 
-    private void chartApply(String version, boolean force) {
+    private void chartApply(String version, boolean force)
+    {
         SchemaBinding sb = new SchemaBinding();
         sb.getMetadata().setName(name);
         SchemaBindingSpec spec = new SchemaBindingSpec();
         spec.setSchemaVersion(version);
         sb.setSpec(spec);
-        client.resources(SchemaBinding.class).inNamespace(ns).withName(name)
+        client.resources(SchemaBinding.class)
+                .inNamespace(ns)
+                .withName(name)
                 .patch(new PatchContext.Builder().withPatchType(PatchType.SERVER_SIDE_APPLY)
-                        .withFieldManager(CHART_MANAGER).withForce(force).build(), sb);
+                        .withFieldManager(CHART_MANAGER)
+                        .withForce(force)
+                        .build(), sb);
     }
 
-    private String specVersion() {
+    private String specVersion()
+    {
         SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
         return sb != null && sb.getSpec() != null ? sb.getSpec().getSchemaVersion() : null;
     }
-    private String statusObserved() {
+
+    private String statusObserved()
+    {
         SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
         return sb != null && sb.getStatus() != null ? sb.getStatus().getObservedSchemaVersion() : null;
     }
@@ -123,8 +180,10 @@ class SchemaSyncOwnershipIT {
      * fragile toString() substring. The SSA fieldset encodes paths as nested keys {@code f:spec}
      * then {@code f:schemaVersion}.
      */
-    private boolean ownsSpecSchemaVersion(String manager) {
-        for (ManagedFieldsEntry e : managedFieldsFor(manager, "Apply")) {
+    private boolean ownsSpecSchemaVersion(String manager)
+    {
+        for (ManagedFieldsEntry e : managedFieldsFor(manager, "Apply"))
+        {
             com.fasterxml.jackson.databind.JsonNode spec = fieldsTree(e).get("f:spec");
             if (spec != null && spec.has("f:schemaVersion")) return true;
         }
@@ -132,15 +191,18 @@ class SchemaSyncOwnershipIT {
     }
 
     /** True iff {@code manager} owns ANY path beneath {@code f:spec} (Apply operation). */
-    private boolean ownsAnySpecPath(String manager) {
-        for (ManagedFieldsEntry e : managedFieldsFor(manager, "Apply")) {
+    private boolean ownsAnySpecPath(String manager)
+    {
+        for (ManagedFieldsEntry e : managedFieldsFor(manager, "Apply"))
+        {
             com.fasterxml.jackson.databind.JsonNode spec = fieldsTree(e).get("f:spec");
             if (spec != null && spec.size() > 0) return true;
         }
         return false;
     }
 
-    private List<ManagedFieldsEntry> managedFieldsFor(String manager, String operation) {
+    private List<ManagedFieldsEntry> managedFieldsFor(String manager, String operation)
+    {
         SchemaBinding sb = client.resources(SchemaBinding.class).inNamespace(ns).withName(name).get();
         List<ManagedFieldsEntry> mf = sb.getMetadata().getManagedFields();
         if (mf == null) return List.of();
@@ -154,18 +216,24 @@ class SchemaSyncOwnershipIT {
             new com.fasterxml.jackson.databind.ObjectMapper();
 
     /** Serialize an entry's fieldsV1 to a JSON tree for structured path inspection. */
-    private com.fasterxml.jackson.databind.JsonNode fieldsTree(ManagedFieldsEntry e) {
-        try {
+    private com.fasterxml.jackson.databind.JsonNode fieldsTree(ManagedFieldsEntry e)
+    {
+        try
+        {
             Object props = e.getFieldsV1() == null ? null : e.getFieldsV1().getAdditionalProperties();
             String json = io.fabric8.kubernetes.client.utils.Serialization.asJson(props == null ? java.util.Map.of() : props);
             return MAPPER.readTree(json);
-        } catch (Exception ex) {
+        }
+        catch (Exception ex)
+        {
             throw new AssertionError("failed to parse managedFields fieldsV1", ex);
         }
     }
 
-    @Test @Timeout(120)
-    void broken_operator_causes_a_chart_apply_conflict_409_and_co_ownership_is_visible() {
+    @Test
+    @Timeout (120)
+    void broken_operator_causes_a_chart_apply_conflict_409_and_co_ownership_is_visible()
+    {
         chartApply("1.0", false);
         assertTrue(ownsSpecSchemaVersion(CHART_MANAGER), "precondition: chart owns spec.schemaVersion");
 
@@ -179,8 +247,10 @@ class SchemaSyncOwnershipIT {
         assertEquals(409, ex.getCode(), "the failure must be an SSA field-ownership conflict (HTTP 409)");
     }
 
-    @Test @Timeout(120)
-    void fixed_operator_writes_status_only_and_introduces_no_spec_claim() {
+    @Test
+    @Timeout (120)
+    void fixed_operator_writes_status_only_and_introduces_no_spec_claim()
+    {
         chartApply("1.0", false);
         new FixedSchemaSyncReconciler(client, ns).reconcile(name);
 
@@ -195,8 +265,10 @@ class SchemaSyncOwnershipIT {
         assertEquals("2.0", specVersion());
     }
 
-    @Test @Timeout(120)
-    void ownership_handoff_drops_broken_spec_claim_but_chart_value_survives() {
+    @Test
+    @Timeout (120)
+    void ownership_handoff_drops_broken_spec_claim_but_chart_value_survives()
+    {
         // Broken state: operator co-owns spec.schemaVersion.
         chartApply("1.0", false);
         new BrokenSchemaSyncReconciler(client, ns).reconcile(name);

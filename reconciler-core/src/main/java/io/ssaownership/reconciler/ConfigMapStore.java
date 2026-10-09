@@ -38,25 +38,36 @@ import java.util.Optional;
  * key"), not a licence to force Kubernetes server-side-apply field-ownership conflicts. SSA
  * ownership is a separate concern handled by the apply mechanism, not by this interface.
  */
-public interface ConfigMapStore {
+public interface ConfigMapStore
+{
+    /**
+     * Thrown for any store failure (API error, missing ConfigMap on write, retry exhaustion).
+     */
+    class StoreException extends RuntimeException
+    {
+        public StoreException(String message, Throwable cause)
+        {
+            super(message, cause);
+        }
 
-    /** Thrown for any store failure (API error, missing ConfigMap on write, retry exhaustion). */
-    class StoreException extends RuntimeException {
-        public StoreException(String message, Throwable cause) { super(message, cause); }
-        public StoreException(String message) { super(message); }
+        public StoreException(String message)
+        {
+            super(message);
+        }
     }
 
     /**
      * @return the current value of {@code key} in {@code configMap}; empty if the ConfigMap does
-     *         not exist OR the key is absent (these two "absent" cases are not distinguished).
-     *         A present empty-string value returns {@code Optional.of("")}. Throws
-     *         {@link StoreException} on API failure (never maps error to empty).
+     * not exist OR the key is absent (these two "absent" cases are not distinguished).
+     * A present empty-string value returns {@code Optional.of("")}. Throws
+     * {@link StoreException} on API failure (never maps error to empty).
      */
     Optional<String> get(String configMap, String key);
 
     /**
      * Create or replace {@code key = value}, preserving unrelated content.
-     * @throws StoreException if the ConfigMap does not exist or the write ultimately fails.
+     *
+     * @throws StoreException       if the ConfigMap does not exist or the write ultimately fails.
      * @throws NullPointerException if value is null.
      */
     void upsert(String configMap, String key, String value);
@@ -64,8 +75,9 @@ public interface ConfigMapStore {
     /**
      * Set {@code key = value} only if the key is currently absent, atomically with respect to
      * concurrent writers (re-read and re-evaluate on conflict). Preserves an existing value.
+     *
      * @return true if it wrote (key was absent), false if an existing value was left untouched.
-     * @throws StoreException if the ConfigMap does not exist or the write ultimately fails.
+     * @throws StoreException       if the ConfigMap does not exist or the write ultimately fails.
      * @throws NullPointerException if value is null.
      */
     boolean putIfAbsent(String configMap, String key, String value);
