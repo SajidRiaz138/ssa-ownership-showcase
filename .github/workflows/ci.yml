@@ -73,7 +73,16 @@ jobs:
           for c in charts/config-reconciler-*; do helm lint "$c"; done
       - name: Assert v1 writes the owned key and v2 does not
         run: |
-          v1=$(helm template r charts/config-reconciler-v1-two-writers | awk '/name: demo-config/,/^---/' | grep -c 'message:')
-          v2=$(helm template r charts/config-reconciler-v2-app-owned   | awk '/name: demo-config/,/^---/' | grep -c 'message:')
-          echo "v1=$v1 v2=$v2"
-          test "$v1" = "1" && test "$v2" = "0"
+          # NOTE: `grep -c` exits non-zero when the count is 0, which under the
+          # shell's errexit would abort this step before the comparison — exactly
+          # the v2 case we WANT to see (count 0). `|| true` keeps the captured
+          # count while discarding that benign non-zero exit.
+          v1=$(helm template r charts/config-reconciler-v1-two-writers | awk '/name: demo-config/,/^---/' | grep -c 'message:' || true)
+          v2=$(helm template r charts/config-reconciler-v2-app-owned   | awk '/name: demo-config/,/^---/' | grep -c 'message:' || true)
+          echo "v1=$v1 (expected 1)  v2=$v2 (expected 0)"
+          if [ "$v1" = "1" ] && [ "$v2" = "0" ]; then
+            echo "SSA invariant holds: v1 chart writes the owned key, v2 (app-owned) does not."
+          else
+            echo "SSA invariant FAILED: expected v1=1 v2=0 but got v1=$v1 v2=$v2" >&2
+            exit 1
+          fi
